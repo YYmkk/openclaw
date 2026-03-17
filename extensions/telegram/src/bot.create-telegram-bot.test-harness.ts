@@ -1,9 +1,9 @@
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import { resetInboundDedupe } from "openclaw/plugin-sdk/reply-runtime";
+import type { MsgContext } from "openclaw/plugin-sdk/reply-runtime";
+import type { GetReplyOptions, ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
+import type { MockFn } from "openclaw/plugin-sdk/test-utils";
 import { beforeEach, vi } from "vitest";
-import { resetInboundDedupe } from "../../../src/auto-reply/reply/inbound-dedupe.js";
-import type { MsgContext } from "../../../src/auto-reply/templating.js";
-import type { GetReplyOptions, ReplyPayload } from "../../../src/auto-reply/types.js";
-import type { OpenClawConfig } from "../../../src/config/config.js";
-import type { MockFn } from "../../../src/test-utils/vitest-mock-fn.js";
 
 type AnyMock = MockFn<(...args: unknown[]) => unknown>;
 type AnyAsyncMock = MockFn<(...args: unknown[]) => Promise<unknown>>;
@@ -31,16 +31,16 @@ const { loadConfig } = vi.hoisted((): { loadConfig: AnyMock } => ({
 export function getLoadConfigMock(): AnyMock {
   return loadConfig;
 }
-vi.mock("../../../src/config/config.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../../src/config/config.js")>();
+vi.mock("openclaw/plugin-sdk/config-runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/config-runtime")>();
   return {
     ...actual,
     loadConfig,
   };
 });
 
-vi.mock("../../../src/config/sessions.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../../src/config/sessions.js")>();
+vi.mock("openclaw/plugin-sdk/config-runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/config-runtime")>();
   return {
     ...actual,
     resolveStorePath: vi.fn((storePath) => storePath ?? sessionStorePath),
@@ -68,7 +68,7 @@ export function getUpsertChannelPairingRequestMock(): AnyAsyncMock {
   return upsertChannelPairingRequest;
 }
 
-vi.mock("../../../src/pairing/pairing-store.js", () => ({
+vi.mock("openclaw/plugin-sdk/conversation-runtime", () => ({
   readChannelAllowFromStore,
   upsertChannelPairingRequest,
 }));
@@ -78,7 +78,7 @@ const skillCommandsHoisted = vi.hoisted(() => ({
 }));
 export const listSkillCommandsForAgents = skillCommandsHoisted.listSkillCommandsForAgents;
 
-vi.mock("../../../src/auto-reply/skill-commands.js", () => ({
+vi.mock("openclaw/plugin-sdk/reply-runtime", () => ({
   listSkillCommandsForAgents,
 }));
 
@@ -87,7 +87,7 @@ const systemEventsHoisted = vi.hoisted(() => ({
 }));
 export const enqueueSystemEventSpy: AnyMock = systemEventsHoisted.enqueueSystemEventSpy;
 
-vi.mock("../../../src/infra/system-events.js", () => ({
+vi.mock("openclaw/plugin-sdk/infra-runtime", () => ({
   enqueueSystemEvent: enqueueSystemEventSpy,
 }));
 
@@ -102,73 +102,81 @@ vi.mock("./sent-message-cache.js", () => ({
   clearSentMessageCache: vi.fn(),
 }));
 
-export const useSpy: MockFn<(arg: unknown) => void> = vi.fn();
-export const middlewareUseSpy: AnyMock = vi.fn();
-export const onSpy: AnyMock = vi.fn();
-export const stopSpy: AnyMock = vi.fn();
-export const commandSpy: AnyMock = vi.fn();
-export const botCtorSpy: AnyMock = vi.fn();
-export const answerCallbackQuerySpy: AnyAsyncMock = vi.fn(async () => undefined);
-export const sendChatActionSpy: AnyMock = vi.fn();
-export const editMessageTextSpy: AnyAsyncMock = vi.fn(async () => ({ message_id: 88 }));
-export const editMessageReplyMarkupSpy: AnyAsyncMock = vi.fn(async () => ({ message_id: 88 }));
-export const sendMessageDraftSpy: AnyAsyncMock = vi.fn(async () => true);
-export const setMessageReactionSpy: AnyAsyncMock = vi.fn(async () => undefined);
-export const setMyCommandsSpy: AnyAsyncMock = vi.fn(async () => undefined);
-export const getMeSpy: AnyAsyncMock = vi.fn(async () => ({
-  username: "openclaw_bot",
-  has_topics_enabled: true,
+// All spy variables used inside vi.mock("grammy", ...) must be created via
+// vi.hoisted() so they are available when the hoisted factory runs, regardless
+// of module evaluation order across different test files.
+const grammySpies = vi.hoisted(() => ({
+  useSpy: vi.fn() as MockFn<(arg: unknown) => void>,
+  middlewareUseSpy: vi.fn() as AnyMock,
+  onSpy: vi.fn() as AnyMock,
+  stopSpy: vi.fn() as AnyMock,
+  commandSpy: vi.fn() as AnyMock,
+  botCtorSpy: vi.fn() as AnyMock,
+  answerCallbackQuerySpy: vi.fn(async () => undefined) as AnyAsyncMock,
+  sendChatActionSpy: vi.fn() as AnyMock,
+  editMessageTextSpy: vi.fn(async () => ({ message_id: 88 })) as AnyAsyncMock,
+  editMessageReplyMarkupSpy: vi.fn(async () => ({ message_id: 88 })) as AnyAsyncMock,
+  sendMessageDraftSpy: vi.fn(async () => true) as AnyAsyncMock,
+  setMessageReactionSpy: vi.fn(async () => undefined) as AnyAsyncMock,
+  setMyCommandsSpy: vi.fn(async () => undefined) as AnyAsyncMock,
+  getMeSpy: vi.fn(async () => ({
+    username: "openclaw_bot",
+    has_topics_enabled: true,
+  })) as AnyAsyncMock,
+  sendMessageSpy: vi.fn(async () => ({ message_id: 77 })) as AnyAsyncMock,
+  sendAnimationSpy: vi.fn(async () => ({ message_id: 78 })) as AnyAsyncMock,
+  sendPhotoSpy: vi.fn(async () => ({ message_id: 79 })) as AnyAsyncMock,
+  getFileSpy: vi.fn(async () => ({ file_path: "media/file.jpg" })) as AnyAsyncMock,
 }));
-export const sendMessageSpy: AnyAsyncMock = vi.fn(async () => ({ message_id: 77 }));
-export const sendAnimationSpy: AnyAsyncMock = vi.fn(async () => ({ message_id: 78 }));
-export const sendPhotoSpy: AnyAsyncMock = vi.fn(async () => ({ message_id: 79 }));
-export const getFileSpy: AnyAsyncMock = vi.fn(async () => ({ file_path: "media/file.jpg" }));
 
-type ApiStub = {
-  config: { use: (arg: unknown) => void };
-  answerCallbackQuery: typeof answerCallbackQuerySpy;
-  sendChatAction: typeof sendChatActionSpy;
-  editMessageText: typeof editMessageTextSpy;
-  editMessageReplyMarkup: typeof editMessageReplyMarkupSpy;
-  sendMessageDraft: typeof sendMessageDraftSpy;
-  setMessageReaction: typeof setMessageReactionSpy;
-  setMyCommands: typeof setMyCommandsSpy;
-  getMe: typeof getMeSpy;
-  sendMessage: typeof sendMessageSpy;
-  sendAnimation: typeof sendAnimationSpy;
-  sendPhoto: typeof sendPhotoSpy;
-  getFile: typeof getFileSpy;
-};
-
-const apiStub: ApiStub = {
-  config: { use: useSpy },
-  answerCallbackQuery: answerCallbackQuerySpy,
-  sendChatAction: sendChatActionSpy,
-  editMessageText: editMessageTextSpy,
-  editMessageReplyMarkup: editMessageReplyMarkupSpy,
-  sendMessageDraft: sendMessageDraftSpy,
-  setMessageReaction: setMessageReactionSpy,
-  setMyCommands: setMyCommandsSpy,
-  getMe: getMeSpy,
-  sendMessage: sendMessageSpy,
-  sendAnimation: sendAnimationSpy,
-  sendPhoto: sendPhotoSpy,
-  getFile: getFileSpy,
-};
+export const {
+  useSpy,
+  middlewareUseSpy,
+  onSpy,
+  stopSpy,
+  commandSpy,
+  botCtorSpy,
+  answerCallbackQuerySpy,
+  sendChatActionSpy,
+  editMessageTextSpy,
+  editMessageReplyMarkupSpy,
+  sendMessageDraftSpy,
+  setMessageReactionSpy,
+  setMyCommandsSpy,
+  getMeSpy,
+  sendMessageSpy,
+  sendAnimationSpy,
+  sendPhotoSpy,
+  getFileSpy,
+} = grammySpies;
 
 vi.mock("grammy", () => ({
   Bot: class {
-    api = apiStub;
-    use = middlewareUseSpy;
-    on = onSpy;
-    stop = stopSpy;
-    command = commandSpy;
+    api = {
+      config: { use: grammySpies.useSpy },
+      answerCallbackQuery: grammySpies.answerCallbackQuerySpy,
+      sendChatAction: grammySpies.sendChatActionSpy,
+      editMessageText: grammySpies.editMessageTextSpy,
+      editMessageReplyMarkup: grammySpies.editMessageReplyMarkupSpy,
+      sendMessageDraft: grammySpies.sendMessageDraftSpy,
+      setMessageReaction: grammySpies.setMessageReactionSpy,
+      setMyCommands: grammySpies.setMyCommandsSpy,
+      getMe: grammySpies.getMeSpy,
+      sendMessage: grammySpies.sendMessageSpy,
+      sendAnimation: grammySpies.sendAnimationSpy,
+      sendPhoto: grammySpies.sendPhotoSpy,
+      getFile: grammySpies.getFileSpy,
+    };
+    use = grammySpies.middlewareUseSpy;
+    on = grammySpies.onSpy;
+    stop = grammySpies.stopSpy;
+    command = grammySpies.commandSpy;
     catch = vi.fn();
     constructor(
       public token: string,
       public options?: { client?: { fetch?: typeof fetch } },
     ) {
-      botCtorSpy(token, options);
+      grammySpies.botCtorSpy(token, options);
     }
   },
   InputFile: class {},
@@ -201,7 +209,7 @@ export const replySpy: MockFn<
   return undefined;
 });
 
-vi.mock("../../../src/auto-reply/reply.js", () => ({
+vi.mock("openclaw/plugin-sdk/reply-runtime", () => ({
   getReplyFromConfig: replySpy,
   __replySpy: replySpy,
 }));
