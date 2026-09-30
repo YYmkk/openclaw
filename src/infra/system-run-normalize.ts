@@ -1,13 +1,12 @@
-import { mapAllowFromEntries } from "../plugin-sdk/channel-config-helpers.js";
+// Normalizes system-run metadata and string-array inputs.
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 
+/** Normalizes unknown system-run metadata to a trimmed non-empty string. */
 export function normalizeNonEmptyString(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
+  return typeof value === "string" ? (normalizeOptionalString(value) ?? null) : null;
 }
 
+/** Coerces array entries to allow-list strings while rejecting non-array inputs. */
 export function normalizeStringArray(value: unknown): string[] {
-  return Array.isArray(value) ? mapAllowFromEntries(value) : [];
+  return Array.isArray(value) ? value.map(String) : [];
 }

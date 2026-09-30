@@ -1,19 +1,20 @@
-import type { PluginRuntime, RuntimeEnv } from "openclaw/plugin-sdk/nextcloud-talk";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import { describe, expect, it, vi } from "vitest";
+import { createRuntimeSpies } from "../../test-support/runtime-spies.js";
 import type { ResolvedNextcloudTalkAccount } from "./accounts.js";
 import { handleNextcloudTalkInbound } from "./inbound.js";
 import { setNextcloudTalkRuntime } from "./runtime.js";
 import type { CoreConfig, NextcloudTalkInboundMessage } from "./types.js";
 
-describe("nextcloud-talk inbound authz", () => {
-  it("does not treat DM pairing-store entries as group allowlist entries", async () => {
-    const readAllowFromStore = vi.fn(async () => ["attacker"]);
-    const buildMentionRegexes = vi.fn(() => [/@openclaw/i]);
-
-    setNextcloudTalkRuntime({
+function installInboundAuthzRuntime(params: {
+  readAllowFromStore: () => Promise<string[]>;
+  buildMentionRegexes: () => RegExp[];
+}) {
+  setNextcloudTalkRuntime(
+    createPluginRuntimeMock({
       channel: {
         pairing: {
-          readAllowFromStore,
+          readAllowFromStore: params.readAllowFromStore,
         },
         commands: {
           shouldHandleTextCommands: () => false,
@@ -22,63 +23,68 @@ describe("nextcloud-talk inbound authz", () => {
           hasControlCommand: () => false,
         },
         mentions: {
-          buildMentionRegexes,
+          buildMentionRegexes: params.buildMentionRegexes,
           matchesMentionPatterns: () => false,
         },
       },
-    } as unknown as PluginRuntime);
+    }),
+  );
+}
 
-    const message: NextcloudTalkInboundMessage = {
-      messageId: "m-1",
-      roomToken: "room-1",
-      roomName: "Room 1",
-      senderId: "attacker",
-      senderName: "Attacker",
-      text: "hello",
-      mediaType: "text/plain",
-      timestamp: Date.now(),
-      isGroupChat: true,
-    };
+function createMessage(
+  overrides: Partial<NextcloudTalkInboundMessage> = {},
+): NextcloudTalkInboundMessage {
+  return {
+    messageId: "m-1",
+    roomToken: "room-1",
+    roomName: "Room 1",
+    senderId: "attacker",
+    senderName: "Attacker",
+    text: "hello",
+    mediaType: "text/plain",
+    timestamp: Date.now(),
+    isGroupChat: true,
+    ...overrides,
+  };
+}
 
-    const account: ResolvedNextcloudTalkAccount = {
-      accountId: "default",
-      enabled: true,
-      baseUrl: "",
-      secret: "",
-      secretSource: "none", // pragma: allowlist secret
-      config: {
-        dmPolicy: "pairing",
-        allowFrom: [],
-        groupPolicy: "allowlist",
-        groupAllowFrom: [],
-      },
-    };
+function createAccount(
+  config: ResolvedNextcloudTalkAccount["config"] = {},
+): ResolvedNextcloudTalkAccount {
+  return {
+    accountId: "default",
+    enabled: true,
+    baseUrl: "",
+    secret: "",
+    secretSource: "none",
+    config: {
+      dmPolicy: "pairing",
+      allowFrom: [],
+      groupPolicy: "allowlist",
+      groupAllowFrom: [],
+      ...config,
+    },
+  };
+}
 
-    const config: CoreConfig = {
-      channels: {
-        "nextcloud-talk": {
-          dmPolicy: "pairing",
-          allowFrom: [],
-          groupPolicy: "allowlist",
-          groupAllowFrom: [],
-        },
-      },
-    };
+describe("nextcloud-talk inbound authz", () => {
+  it("does not treat DM pairing-store entries as group allowlist entries", async () => {
+    const readAllowFromStore = vi.fn(async () => ["attacker"]);
+    const buildMentionRegexes = vi.fn(() => [/@openclaw/i]);
+
+    installInboundAuthzRuntime({ readAllowFromStore, buildMentionRegexes });
+
+    const account = createAccount();
+    const config: CoreConfig = { channels: { "nextcloud-talk": account.config } };
 
     await handleNextcloudTalkInbound({
-      message,
+      message: createMessage(),
       account,
       config,
-      runtime: {
-        log: vi.fn(),
-        error: vi.fn(),
-      } as unknown as RuntimeEnv,
+      runtime: createRuntimeSpies(),
     });
 
-    expect(readAllowFromStore).toHaveBeenCalledWith({
-      channel: "nextcloud-talk",
-      accountId: "default",
-    });
+    expect(readAllowFromStore).not.toHaveBeenCalled();
     expect(buildMentionRegexes).not.toHaveBeenCalled();
   });
 
@@ -86,58 +92,20 @@ describe("nextcloud-talk inbound authz", () => {
     const readAllowFromStore = vi.fn(async () => []);
     const buildMentionRegexes = vi.fn(() => [/@openclaw/i]);
 
-    setNextcloudTalkRuntime({
-      channel: {
-        pairing: {
-          readAllowFromStore,
-        },
-        commands: {
-          shouldHandleTextCommands: () => false,
-        },
-        text: {
-          hasControlCommand: () => false,
-        },
-        mentions: {
-          buildMentionRegexes,
-          matchesMentionPatterns: () => false,
-        },
-      },
-    } as unknown as PluginRuntime);
-
-    const message: NextcloudTalkInboundMessage = {
-      messageId: "m-2",
-      roomToken: "room-attacker",
-      roomName: "Room Trusted",
-      senderId: "trusted-user",
-      senderName: "Trusted User",
-      text: "hello",
-      mediaType: "text/plain",
-      timestamp: Date.now(),
-      isGroupChat: true,
-    };
-
-    const account: ResolvedNextcloudTalkAccount = {
-      accountId: "default",
-      enabled: true,
-      baseUrl: "",
-      secret: "",
-      secretSource: "none",
-      config: {
-        dmPolicy: "pairing",
-        allowFrom: [],
-        groupPolicy: "allowlist",
-        groupAllowFrom: ["trusted-user"],
-        rooms: {
-          "room-trusted": {
-            enabled: true,
-          },
-        },
-      },
-    };
+    installInboundAuthzRuntime({ readAllowFromStore, buildMentionRegexes });
 
     await handleNextcloudTalkInbound({
-      message,
-      account,
+      message: createMessage({
+        messageId: "m-2",
+        roomToken: "room-attacker",
+        roomName: "Room Trusted",
+        senderId: "trusted-user",
+        senderName: "Trusted User",
+      }),
+      account: createAccount({
+        groupAllowFrom: ["trusted-user"],
+        rooms: { "room-trusted": { enabled: true } },
+      }),
       config: {
         channels: {
           "nextcloud-talk": {
@@ -146,10 +114,7 @@ describe("nextcloud-talk inbound authz", () => {
           },
         },
       },
-      runtime: {
-        log: vi.fn(),
-        error: vi.fn(),
-      } as unknown as RuntimeEnv,
+      runtime: createRuntimeSpies(),
     });
 
     expect(buildMentionRegexes).not.toHaveBeenCalled();

@@ -1,125 +1,128 @@
-import { mapAllowlistResolutionInputs } from "openclaw/plugin-sdk/allowlist-resolution";
 import type {
   ChannelDirectoryEntry,
   ChannelResolveKind,
   ChannelResolveResult,
-  RuntimeEnv,
-} from "openclaw/plugin-sdk/matrix";
+} from "openclaw/plugin-sdk/channel-contract";
+import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
+import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { listMatrixDirectoryGroupsLive, listMatrixDirectoryPeersLive } from "./directory-live.js";
+import { isMatrixQualifiedUserId, normalizeMatrixMessagingTarget } from "./matrix/target-ids.js";
+
+function normalizeLookupQuery(query: string): string {
+  return normalizeOptionalLowercaseString(query) ?? "";
+}
 
 function findExactDirectoryMatches(
   matches: ChannelDirectoryEntry[],
   query: string,
 ): ChannelDirectoryEntry[] {
-  const normalized = query.trim().toLowerCase();
+  const normalized = normalizeLookupQuery(query);
   if (!normalized) {
     return [];
   }
   return matches.filter((match) => {
-    const id = match.id.trim().toLowerCase();
-    const name = match.name?.trim().toLowerCase();
-    const handle = match.handle?.trim().toLowerCase();
+    const id = normalizeOptionalLowercaseString(match.id);
+    const name = normalizeOptionalLowercaseString(match.name);
+    const handle = normalizeOptionalLowercaseString(match.handle);
     return normalized === id || normalized === name || normalized === handle;
   });
 }
 
-function pickBestGroupMatch(
+function pickBestDirectoryMatch(
   matches: ChannelDirectoryEntry[],
   query: string,
-): ChannelDirectoryEntry | undefined {
-  if (matches.length === 0) {
-    return undefined;
-  }
-  const [exact] = findExactDirectoryMatches(matches, query);
-  return exact ?? matches[0];
-}
-
-function pickBestUserMatch(
-  matches: ChannelDirectoryEntry[],
-  query: string,
-): ChannelDirectoryEntry | undefined {
-  if (matches.length === 0) {
-    return undefined;
-  }
+  kind: ChannelResolveKind,
+): { best?: ChannelDirectoryEntry; note?: string } {
   const exact = findExactDirectoryMatches(matches, query);
-  if (exact.length === 1) {
-    return exact[0];
+  if (kind === "user") {
+    return exact.length === 1
+      ? { best: exact[0] }
+      : {
+          note:
+            matches.length === 0
+              ? "no matches"
+              : exact.length > 1
+                ? "multiple exact matches; use full Matrix ID"
+                : "no exact match; use full Matrix ID",
+        };
   }
-  return undefined;
+  const candidates = exact.length > 0 ? exact : matches;
+  return {
+    best: candidates[0],
+    note:
+      candidates.length > 1
+        ? `multiple ${exact.length > 0 ? "exact " : ""}matches; chose first`
+        : undefined,
+  };
 }
 
-function describeUserMatchFailure(matches: ChannelDirectoryEntry[], query: string): string {
-  if (matches.length === 0) {
-    return "no matches";
+async function readCachedMatches(
+  cache: Map<string, ChannelDirectoryEntry[]>,
+  query: string,
+  lookup: (query: string) => Promise<ChannelDirectoryEntry[]>,
+): Promise<ChannelDirectoryEntry[]> {
+  const key = normalizeLookupQuery(query);
+  if (!key) {
+    return [];
   }
-  const normalized = query.trim().toLowerCase();
-  if (!normalized) {
-    return "empty input";
+  const cached = cache.get(key);
+  if (cached) {
+    return cached;
   }
-  const exact = findExactDirectoryMatches(matches, normalized);
-  if (exact.length === 0) {
-    return "no exact match; use full Matrix ID";
-  }
-  if (exact.length > 1) {
-    return "multiple exact matches; use full Matrix ID";
-  }
-  return "no exact match; use full Matrix ID";
+  const matches = await lookup(query.trim());
+  cache.set(key, matches);
+  return matches;
 }
 
 export async function resolveMatrixTargets(params: {
   cfg: unknown;
+  accountId?: string | null;
   inputs: string[];
   kind: ChannelResolveKind;
   runtime?: RuntimeEnv;
 }): Promise<ChannelResolveResult[]> {
-  return await mapAllowlistResolutionInputs({
-    inputs: params.inputs,
-    mapInput: async (input): Promise<ChannelResolveResult> => {
-      const trimmed = input.trim();
-      if (!trimmed) {
-        return { input, resolved: false, note: "empty input" };
-      }
-      if (params.kind === "user") {
-        if (trimmed.startsWith("@") && trimmed.includes(":")) {
-          return { input, resolved: true, id: trimmed };
-        }
-        try {
-          const matches = await listMatrixDirectoryPeersLive({
-            cfg: params.cfg,
-            query: trimmed,
-            limit: 5,
-          });
-          const best = pickBestUserMatch(matches, trimmed);
-          return {
-            input,
-            resolved: Boolean(best?.id),
-            id: best?.id,
-            name: best?.name,
-            note: best ? undefined : describeUserMatchFailure(matches, trimmed),
-          };
-        } catch (err) {
-          params.runtime?.error?.(`matrix resolve failed: ${String(err)}`);
-          return { input, resolved: false, note: "lookup failed" };
-        }
-      }
-      try {
-        const matches = await listMatrixDirectoryGroupsLive({
+  const results: ChannelResolveResult[] = [];
+  const lookupCache = new Map<string, ChannelDirectoryEntry[]>();
+  const lookup =
+    params.kind === "user" ? listMatrixDirectoryPeersLive : listMatrixDirectoryGroupsLive;
+
+  for (const input of params.inputs) {
+    const trimmed = input.trim();
+    if (!trimmed) {
+      results.push({ input, resolved: false, note: "empty input" });
+      continue;
+    }
+    const normalizedTarget = normalizeMatrixMessagingTarget(trimmed);
+    if (
+      normalizedTarget &&
+      (params.kind === "user"
+        ? isMatrixQualifiedUserId(normalizedTarget)
+        : normalizedTarget.startsWith("!"))
+    ) {
+      results.push({ input, resolved: true, id: normalizedTarget });
+      continue;
+    }
+    try {
+      const matches = await readCachedMatches(lookupCache, trimmed, (query) =>
+        lookup({
           cfg: params.cfg,
-          query: trimmed,
+          accountId: params.accountId,
+          query,
           limit: 5,
-        });
-        const best = pickBestGroupMatch(matches, trimmed);
-        return {
-          input,
-          resolved: Boolean(best?.id),
-          id: best?.id,
-          name: best?.name,
-          note: matches.length > 1 ? "multiple matches; chose first" : undefined,
-        };
-      } catch (err) {
-        params.runtime?.error?.(`matrix resolve failed: ${String(err)}`);
-        return { input, resolved: false, note: "lookup failed" };
-      }
-    },
-  });
+        }),
+      );
+      const { best, note } = pickBestDirectoryMatch(matches, trimmed, params.kind);
+      results.push({
+        input,
+        resolved: Boolean(best?.id),
+        id: best?.id,
+        name: best?.name,
+        note,
+      });
+    } catch (err) {
+      params.runtime?.error?.(`matrix resolve failed: ${String(err)}`);
+      results.push({ input, resolved: false, note: "lookup failed" });
+    }
+  }
+  return results;
 }

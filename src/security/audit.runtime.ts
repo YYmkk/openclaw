@@ -1,1 +1,2 @@
-export { runSecurityAudit } from "./audit.js";
+// Runtime boundary for invoking the security audit implementation.
+export { runSecurityAuditCore as runSecurityAudit } from "./audit.js";

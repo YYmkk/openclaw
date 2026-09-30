@@ -1,18 +1,16 @@
-import { normalizeCommandBody } from "./commands-registry.js";
+// Group activation command parser for mention/always auto-reply modes.
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 
+/** Supported group activation modes. */
 export type GroupActivationMode = "mention" | "always";
 
+/** Normalize a raw group activation mode string. */
 export function normalizeGroupActivation(raw?: string | null): GroupActivationMode | undefined {
-  const value = raw?.trim().toLowerCase();
-  if (value === "mention") {
-    return "mention";
-  }
-  if (value === "always") {
-    return "always";
-  }
-  return undefined;
+  const value = normalizeOptionalLowercaseString(raw);
+  return value === "mention" || value === "always" ? value : undefined;
 }
 
+/** Parse `/activation` commands from inbound message text. */
 export function parseActivationCommand(raw?: string): {
   hasCommand: boolean;
   mode?: GroupActivationMode;
@@ -24,7 +22,10 @@ export function parseActivationCommand(raw?: string): {
   if (!trimmed) {
     return { hasCommand: false };
   }
-  const normalized = normalizeCommandBody(trimmed);
+  const normalized = trimmed.replace(/^\/([^\s:]+)\s*:(.*)$/, (_, cmd: string, rest: string) => {
+    const trimmedRest = rest.trimStart();
+    return trimmedRest ? `/${cmd} ${trimmedRest}` : `/${cmd}`;
+  });
   const match = normalized.match(/^\/activation(?:\s+([a-zA-Z]+))?\s*$/i);
   if (!match) {
     return { hasCommand: false };

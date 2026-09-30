@@ -1,63 +1,147 @@
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-import { CURRENT_SESSION_VERSION, SessionManager } from "@mariozechner/pi-coding-agent";
-import type { OpenClawConfig } from "../../config/config.js";
-import { resolveSessionFilePath, type SessionEntry } from "../../config/sessions.js";
+import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
+import {
+  forkSessionEntryFromParentTarget,
+  forkSessionFromParentTranscript,
+  resolveSessionParentForkDecision,
+  type ForkSessionEntryFromParentTargetParams,
+  type ForkSessionEntryFromParentTargetResult,
+  type SessionParentForkDecision,
+} from "../../config/sessions/session-accessor.js";
+import { prepareSessionForkTranscript } from "../../config/sessions/session-accessor.sqlite-parent-session.js";
+import type { SessionEntry } from "../../config/sessions/types.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import {
+  assertModelSelectionUnlocked,
+  MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE,
+} from "../../sessions/model-overrides.js";
 
-/**
- * Default max parent token count beyond which thread/session parent forking is skipped.
- * This prevents new thread sessions from inheriting near-full parent context.
- * See #26905.
- */
-const DEFAULT_PARENT_FORK_MAX_TOKENS = 100_000;
+export { MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE } from "../../sessions/model-overrides.js";
 
-export function resolveParentForkMaxTokens(cfg: OpenClawConfig): number {
-  const configured = cfg.session?.parentForkMaxTokens;
-  if (typeof configured === "number" && Number.isFinite(configured) && configured >= 0) {
-    return Math.floor(configured);
-  }
-  return DEFAULT_PARENT_FORK_MAX_TOKENS;
-}
+type ParentForkDecisionParams = {
+  parentEntry: SessionEntry;
+  agentId?: string;
+  config?: OpenClawConfig;
+  storePath?: string;
+};
 
-export function forkSessionFromParent(params: {
+type ForkSessionFromParentParams = {
+  maxTokens?: number;
+  parentSessionKey: string;
   parentEntry: SessionEntry;
   agentId: string;
-  sessionsDir: string;
-}): { sessionId: string; sessionFile: string } | null {
-  const parentSessionFile = resolveSessionFilePath(
-    params.parentEntry.sessionId,
-    params.parentEntry,
-    { agentId: params.agentId, sessionsDir: params.sessionsDir },
+  commitGuard?: () => void;
+  config?: OpenClawConfig;
+  sessionKey: string;
+  storePath?: string;
+  forkFrom?: "last-completed";
+
+  /** Cross-agent forks land the child transcript in the target agent's store. */
+  targetStorePath?: string;
+};
+
+type ForkSessionEntryFromParentParams = Omit<ForkSessionFromParentParams, "parentEntry"> &
+  Pick<
+    ForkSessionEntryFromParentTargetParams,
+    "fallbackEntry" | "patch" | "skipForkWhen" | "skipPatch" | "decisionSkipPatch"
+  > & {
+    parentStoreKeys?: readonly string[];
+    sessionStoreKeys?: readonly string[];
+  };
+
+function resolveParentForkStorePath(params: {
+  agentId?: string;
+  config?: OpenClawConfig;
+  storePath?: string;
+}): string {
+  return (
+    params.storePath ??
+    resolveSessionStorePathCore(params.config?.session?.store, { agentId: params.agentId })
   );
-  if (!parentSessionFile || !fs.existsSync(parentSessionFile)) {
-    return null;
-  }
-  try {
-    const manager = SessionManager.open(parentSessionFile);
-    const leafId = manager.getLeafId();
-    if (leafId) {
-      const sessionFile = manager.createBranchedSession(leafId) ?? manager.getSessionFile();
-      const sessionId = manager.getSessionId();
-      if (sessionFile && sessionId) {
-        return { sessionId, sessionFile };
-      }
-    }
-    const sessionId = crypto.randomUUID();
-    const timestamp = new Date().toISOString();
-    const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-    const sessionFile = path.join(manager.getSessionDir(), `${fileTimestamp}_${sessionId}.jsonl`);
-    const header = {
-      type: "session",
-      version: CURRENT_SESSION_VERSION,
-      id: sessionId,
-      timestamp,
-      cwd: manager.getCwd(),
-      parentSession: parentSessionFile,
-    };
-    fs.writeFileSync(sessionFile, `${JSON.stringify(header)}\n`, "utf-8");
-    return { sessionId, sessionFile };
-  } catch {
-    return null;
-  }
+}
+
+export async function resolveParentForkDecision(
+  params: ParentForkDecisionParams,
+): Promise<SessionParentForkDecision> {
+  assertModelSelectionUnlocked(params.parentEntry, MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE);
+  return await resolveSessionParentForkDecision({
+    parentEntry: params.parentEntry,
+    storePath: resolveParentForkStorePath(params),
+  });
+}
+
+export async function forkSessionFromParent(
+  params: ForkSessionFromParentParams,
+): Promise<{ sessionId: string; sessionFile: string } | null> {
+  // Keep direct callers fail-closed even if they skipped the normal decision step.
+  assertModelSelectionUnlocked(params.parentEntry, MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE);
+  const storePath = resolveParentForkStorePath(params);
+  const fork = await forkSessionFromParentTranscript({
+    agentId: params.agentId,
+    ...(params.commitGuard ? { commitGuard: params.commitGuard } : {}),
+    parentEntry: params.parentEntry,
+    parentSessionKey: params.parentSessionKey,
+    sessionKey: params.sessionKey,
+    storePath,
+    ...(params.forkFrom ? { forkFrom: params.forkFrom } : {}),
+    ...(params.targetStorePath ? { targetStorePath: params.targetStorePath } : {}),
+  });
+  return fork.status === "created" ? fork.transcript : null;
+}
+
+export async function prepareSessionForkFromParent(params: ForkSessionFromParentParams) {
+  assertModelSelectionUnlocked(params.parentEntry, MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE);
+  return await prepareSessionForkTranscript({
+    agentId: params.agentId,
+    ...(params.commitGuard ? { commitGuard: params.commitGuard } : {}),
+    enforceTokenLimit: true,
+    ...(params.maxTokens ? { maxTokens: params.maxTokens } : {}),
+    parentEntry: params.parentEntry,
+    parentSessionKey: params.parentSessionKey,
+    sessionKey: params.sessionKey,
+    storePath: resolveParentForkStorePath(params),
+    ...(params.forkFrom ? { forkFrom: params.forkFrom } : {}),
+    ...(params.targetStorePath ? { targetStorePath: params.targetStorePath } : {}),
+  });
+}
+
+function normalizeForkTarget(params: { canonicalKey: string; storeKeys?: readonly string[] }): {
+  canonicalKey: string;
+  storeKeys: string[];
+} {
+  return {
+    canonicalKey: params.canonicalKey,
+    storeKeys: [
+      ...new Set(
+        [params.canonicalKey, ...(params.storeKeys ?? [])].map((key) => key.trim()).filter(Boolean),
+      ),
+    ],
+  };
+}
+
+/**
+ * Forks the parent transcript and persists the child session entry through one
+ * storage boundary operation.
+ */
+export async function forkSessionEntryFromParent(
+  params: ForkSessionEntryFromParentParams,
+): Promise<ForkSessionEntryFromParentTargetResult> {
+  const storePath = resolveParentForkStorePath(params);
+  return await forkSessionEntryFromParentTarget({
+    agentId: params.agentId,
+    commitGuard: params.commitGuard,
+    decisionSkipPatch: params.decisionSkipPatch,
+    fallbackEntry: params.fallbackEntry,
+    parentTarget: normalizeForkTarget({
+      canonicalKey: params.parentSessionKey,
+      storeKeys: params.parentStoreKeys,
+    }),
+    patch: params.patch,
+    sessionTarget: normalizeForkTarget({
+      canonicalKey: params.sessionKey,
+      storeKeys: params.sessionStoreKeys,
+    }),
+    skipForkWhen: params.skipForkWhen,
+    skipPatch: params.skipPatch,
+    storePath,
+  });
 }

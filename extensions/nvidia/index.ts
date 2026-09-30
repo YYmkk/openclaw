@@ -1,32 +1,46 @@
-import { emptyPluginConfigSchema, type OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { buildSingleProviderApiKeyCatalog } from "openclaw/plugin-sdk/provider-catalog";
-import { buildNvidiaProvider } from "./provider-catalog.js";
+import { defineSingleProviderPluginEntry } from "openclaw/plugin-sdk/provider-entry";
+import { applyNvidiaConnectionConfig, NVIDIA_DEFAULT_MODEL_REF } from "./onboard.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
+import { buildLiveNvidiaProvider, buildSelectableNvidiaProvider } from "./provider-catalog.js";
 
 const PROVIDER_ID = "nvidia";
 
-const nvidiaPlugin = {
+export default defineSingleProviderPluginEntry({
   id: PROVIDER_ID,
   name: "NVIDIA Provider",
   description: "Bundled NVIDIA provider plugin",
-  configSchema: emptyPluginConfigSchema(),
-  register(api: OpenClawPluginApi) {
-    api.registerProvider({
-      id: PROVIDER_ID,
-      label: "NVIDIA",
-      docsPath: "/providers/nvidia",
-      envVars: ["NVIDIA_API_KEY"],
-      auth: [],
-      catalog: {
-        order: "simple",
-        run: (ctx) =>
-          buildSingleProviderApiKeyCatalog({
-            ctx,
-            providerId: PROVIDER_ID,
-            buildProvider: buildNvidiaProvider,
-          }),
+  manifest,
+  provider: {
+    label: "NVIDIA",
+    docsPath: "/providers/nvidia",
+    preserveLiteralProviderPrefix: true,
+    manifestAuth: {
+      defaultModel: NVIDIA_DEFAULT_MODEL_REF,
+      applyConfig: applyNvidiaConnectionConfig,
+    },
+    catalog: {
+      discoveryMode: "strict",
+      buildProvider: buildLiveNvidiaProvider,
+      buildStaticProvider: buildSelectableNvidiaProvider,
+    },
+    wizard: {
+      setup: {
+        choiceId: "nvidia-api-key",
+        choiceLabel: "NVIDIA API key",
+        groupId: "nvidia",
+        groupLabel: "NVIDIA",
+        groupHint: "Direct API key",
+        methodId: "api-key",
+        modelSelection: {
+          promptWhenAuthChoiceProvided: true,
+          allowKeepCurrent: false,
+        },
       },
-    });
+      modelPicker: {
+        label: "NVIDIA (custom)",
+        hint: "Use NVIDIA-hosted open models",
+        methodId: "api-key",
+      },
+    },
   },
-};
-
-export default nvidiaPlugin;
+});

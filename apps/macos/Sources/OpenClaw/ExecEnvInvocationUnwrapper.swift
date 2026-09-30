@@ -12,30 +12,51 @@ enum ExecCommandToken {
 enum ExecEnvInvocationUnwrapper {
     static let maxWrapperDepth = 4
 
+    struct UnwrapResult {
+        let command: [String]
+        let usesModifiers: Bool
+    }
+
     private static func isEnvAssignment(_ token: String) -> Bool {
         let pattern = #"^[A-Za-z_][A-Za-z0-9_]*=.*"#
         return token.range(of: pattern, options: .regularExpression) != nil
     }
 
     static func unwrap(_ command: [String]) -> [String]? {
+        self.unwrapWithMetadata(command)?.command
+    }
+
+    static func unwrapWithMetadata(
+        _ command: [String],
+        skippingEmptyArguments: Bool = false) -> UnwrapResult?
+    {
         var idx = 1
         var expectsOptionValue = false
+        var usesModifiers = false
         while idx < command.count {
             let token = command[idx].trimmingCharacters(in: .whitespacesAndNewlines)
             if token.isEmpty {
+                guard skippingEmptyArguments else { return nil }
                 idx += 1
                 continue
             }
             if expectsOptionValue {
                 expectsOptionValue = false
+                usesModifiers = true
                 idx += 1
                 continue
             }
-            if token == "--" || token == "-" {
+            if token == "--" {
+                idx += 1
+                break
+            }
+            if token == "-" {
+                usesModifiers = true
                 idx += 1
                 break
             }
             if self.isEnvAssignment(token) {
+                usesModifiers = true
                 idx += 1
                 continue
             }
@@ -43,26 +64,20 @@ enum ExecEnvInvocationUnwrapper {
                 let lower = token.lowercased()
                 let flag = lower.split(separator: "=", maxSplits: 1).first.map(String.init) ?? lower
                 if ExecEnvOptions.flagOnly.contains(flag) {
+                    usesModifiers = true
                     idx += 1
                     continue
                 }
                 if ExecEnvOptions.withValue.contains(flag) {
+                    usesModifiers = true
                     if !lower.contains("=") {
                         expectsOptionValue = true
                     }
                     idx += 1
                     continue
                 }
-                if lower.hasPrefix("-u") ||
-                    lower.hasPrefix("-c") ||
-                    lower.hasPrefix("-s") ||
-                    lower.hasPrefix("--unset=") ||
-                    lower.hasPrefix("--chdir=") ||
-                    lower.hasPrefix("--split-string=") ||
-                    lower.hasPrefix("--default-signal=") ||
-                    lower.hasPrefix("--ignore-signal=") ||
-                    lower.hasPrefix("--block-signal=")
-                {
+                if ExecEnvOptions.inlineValuePrefixes.contains(where: { lower.hasPrefix($0) }) {
+                    usesModifiers = true
                     idx += 1
                     continue
                 }
@@ -70,8 +85,11 @@ enum ExecEnvInvocationUnwrapper {
             }
             break
         }
-        guard idx < command.count else { return nil }
-        return Array(command[idx...])
+        guard !expectsOptionValue,
+              idx < command.count,
+              skippingEmptyArguments || !command[idx].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return UnwrapResult(command: Array(command[idx...]), usesModifiers: usesModifiers)
     }
 
     static func unwrapDispatchWrappersForResolution(_ command: [String]) -> [String] {
@@ -84,10 +102,13 @@ enum ExecEnvInvocationUnwrapper {
             guard ExecCommandToken.basenameLower(token) == "env" else {
                 break
             }
-            guard let unwrapped = self.unwrap(current), !unwrapped.isEmpty else {
+            guard let unwrapped = unwrapWithMetadata(current), !unwrapped.command.isEmpty else {
                 break
             }
-            current = unwrapped
+            if unwrapped.usesModifiers {
+                break
+            }
+            current = unwrapped.command
             depth += 1
         }
         return current

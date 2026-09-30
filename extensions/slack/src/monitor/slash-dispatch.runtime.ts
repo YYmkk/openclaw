@@ -1,9 +1,9 @@
-export { resolveChunkMode } from "openclaw/plugin-sdk/reply-runtime";
-export { finalizeInboundContext } from "openclaw/plugin-sdk/reply-runtime";
-export { dispatchReplyWithDispatcher } from "openclaw/plugin-sdk/reply-runtime";
-export { resolveConversationLabel } from "openclaw/plugin-sdk/channel-runtime";
-export { createReplyPrefixOptions } from "openclaw/plugin-sdk/channel-runtime";
-export { recordInboundSessionMetaSafe } from "openclaw/plugin-sdk/channel-runtime";
-export { resolveMarkdownTableMode } from "openclaw/plugin-sdk/config-runtime";
+export {
+  dispatchChannelInboundTurn,
+  isChannelPartialDeliveryError,
+} from "openclaw/plugin-sdk/channel-inbound";
+export { resolveConversationLabel } from "openclaw/plugin-sdk/conversation-runtime";
+export { resolveMarkdownTableMode } from "openclaw/plugin-sdk/markdown-table-runtime";
+export { finalizeInboundContext, resolveChunkMode } from "openclaw/plugin-sdk/reply-runtime";
 export { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
-export { deliverSlackSlashReplies } from "./replies.js";
+export { deliverSlackSlashReplies, sanitizeSlackMonitorReplyPayload } from "./replies.js";

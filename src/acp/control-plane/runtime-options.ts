@@ -1,9 +1,18 @@
 import { isAbsolute } from "node:path";
+import type { AcpRuntimeConfigOptionResult } from "@openclaw/acp-core/runtime/types";
+import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString as normalizeText,
+} from "@openclaw/normalization-core/string-coerce";
 import type { AcpSessionRuntimeOptions, SessionAcpMeta } from "../../config/sessions/types.js";
 import { AcpRuntimeError } from "../runtime/errors.js";
 
+export { normalizeOptionalString as normalizeText } from "@openclaw/normalization-core/string-coerce";
+
 const MAX_RUNTIME_MODE_LENGTH = 64;
 const MAX_MODEL_LENGTH = 200;
+const MAX_THINKING_LENGTH = 32;
 const MAX_PERMISSION_PROFILE_LENGTH = 80;
 const MAX_CWD_LENGTH = 4096;
 const MIN_TIMEOUT_SECONDS = 1;
@@ -13,6 +22,13 @@ const MAX_BACKEND_OPTION_VALUE_LENGTH = 512;
 const MAX_BACKEND_EXTRAS = 32;
 
 const SAFE_OPTION_KEY_RE = /^[a-z0-9][a-z0-9._:-]*$/i;
+// User-facing config aliases accepted by ACP clients and normalized to session runtime options.
+const RUNTIME_CONFIG_OPTION_ALIASES = {
+  model: ["model"],
+  thinking: ["thinking", "effort", "reasoning_effort", "thought_level"],
+  permissionProfile: ["approval_policy", "permission_profile", "permissions", "permission_mode"],
+  timeoutSeconds: ["timeout", "timeout_seconds"],
+} as const;
 
 function failInvalidOption(message: string): never {
   throw new AcpRuntimeError("ACP_INVALID_RUNTIME_OPTION", message);
@@ -77,6 +93,14 @@ export function validateRuntimeModelInput(rawModel: unknown): string {
   });
 }
 
+function validateRuntimeThinkingInput(rawThinking: unknown): string {
+  return validateBoundedText({
+    value: rawThinking,
+    field: "Thinking level",
+    maxLength: MAX_THINKING_LENGTH,
+  });
+}
+
 export function validateRuntimePermissionProfileInput(rawProfile: unknown): string {
   return validateBoundedText({
     value: rawProfile,
@@ -97,7 +121,7 @@ export function validateRuntimeCwdInput(rawCwd: unknown): string {
   return cwd;
 }
 
-export function validateRuntimeTimeoutSecondsInput(rawTimeout: unknown): number {
+function validateRuntimeTimeoutSecondsInput(rawTimeout: unknown): number {
   if (typeof rawTimeout !== "number" || !Number.isFinite(rawTimeout)) {
     failInvalidOption("Timeout must be a positive integer in seconds.");
   }
@@ -115,7 +139,7 @@ export function parseRuntimeTimeoutSecondsInput(rawTimeout: unknown): number {
   if (!normalized || !/^\d+$/.test(normalized)) {
     failInvalidOption("Timeout must be a positive integer in seconds.");
   }
-  return validateRuntimeTimeoutSecondsInput(Number.parseInt(normalized, 10));
+  return validateRuntimeTimeoutSecondsInput(parseStrictPositiveInteger(normalized) ?? 0);
 }
 
 export function validateRuntimeConfigOptionInput(
@@ -141,6 +165,7 @@ export function validateRuntimeOptionPatch(
   const allowedKeys = new Set([
     "runtimeMode",
     "model",
+    "thinking",
     "cwd",
     "permissionProfile",
     "timeoutSeconds",
@@ -153,41 +178,21 @@ export function validateRuntimeOptionPatch(
   }
 
   const next: Partial<AcpSessionRuntimeOptions> = {};
-  if (Object.hasOwn(rawPatch, "runtimeMode")) {
-    if (rawPatch.runtimeMode === undefined) {
-      next.runtimeMode = undefined;
-    } else {
-      next.runtimeMode = validateRuntimeModeInput(rawPatch.runtimeMode);
+  function setOption<K extends Exclude<keyof AcpSessionRuntimeOptions, "backendExtras">>(
+    key: K,
+    validate: (value: unknown) => AcpSessionRuntimeOptions[K],
+  ): void {
+    // Own undefined clears an option; missing and inherited fields leave it unchanged.
+    if (Object.hasOwn(rawPatch, key)) {
+      next[key] = rawPatch[key] === undefined ? undefined : validate(rawPatch[key]);
     }
   }
-  if (Object.hasOwn(rawPatch, "model")) {
-    if (rawPatch.model === undefined) {
-      next.model = undefined;
-    } else {
-      next.model = validateRuntimeModelInput(rawPatch.model);
-    }
-  }
-  if (Object.hasOwn(rawPatch, "cwd")) {
-    if (rawPatch.cwd === undefined) {
-      next.cwd = undefined;
-    } else {
-      next.cwd = validateRuntimeCwdInput(rawPatch.cwd);
-    }
-  }
-  if (Object.hasOwn(rawPatch, "permissionProfile")) {
-    if (rawPatch.permissionProfile === undefined) {
-      next.permissionProfile = undefined;
-    } else {
-      next.permissionProfile = validateRuntimePermissionProfileInput(rawPatch.permissionProfile);
-    }
-  }
-  if (Object.hasOwn(rawPatch, "timeoutSeconds")) {
-    if (rawPatch.timeoutSeconds === undefined) {
-      next.timeoutSeconds = undefined;
-    } else {
-      next.timeoutSeconds = validateRuntimeTimeoutSecondsInput(rawPatch.timeoutSeconds);
-    }
-  }
+  setOption("runtimeMode", validateRuntimeModeInput);
+  setOption("model", validateRuntimeModelInput);
+  setOption("thinking", validateRuntimeThinkingInput);
+  setOption("cwd", validateRuntimeCwdInput);
+  setOption("permissionProfile", validateRuntimePermissionProfileInput);
+  setOption("timeoutSeconds", validateRuntimeTimeoutSecondsInput);
   if (Object.hasOwn(rawPatch, "backendExtras")) {
     const rawExtras = rawPatch.backendExtras;
     if (rawExtras === undefined) {
@@ -211,19 +216,12 @@ export function validateRuntimeOptionPatch(
   return next;
 }
 
-export function normalizeText(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed || undefined;
-}
-
 export function normalizeRuntimeOptions(
   options: AcpSessionRuntimeOptions | undefined,
 ): AcpSessionRuntimeOptions {
   const runtimeMode = normalizeText(options?.runtimeMode);
   const model = normalizeText(options?.model);
+  const thinking = normalizeText(options?.thinking);
   const cwd = normalizeText(options?.cwd);
   const permissionProfile = normalizeText(options?.permissionProfile);
   let timeoutSeconds: number | undefined;
@@ -241,6 +239,7 @@ export function normalizeRuntimeOptions(
   return {
     ...(runtimeMode ? { runtimeMode } : {}),
     ...(model ? { model } : {}),
+    ...(thinking ? { thinking } : {}),
     ...(cwd ? { cwd } : {}),
     ...(permissionProfile ? { permissionProfile } : {}),
     ...(typeof timeoutSeconds === "number" ? { timeoutSeconds } : {}),
@@ -253,15 +252,49 @@ export function mergeRuntimeOptions(params: {
   patch?: Partial<AcpSessionRuntimeOptions>;
 }): AcpSessionRuntimeOptions {
   const current = normalizeRuntimeOptions(params.current);
-  const patch = normalizeRuntimeOptions(validateRuntimeOptionPatch(params.patch));
-  const mergedExtras = {
-    ...current.backendExtras,
-    ...patch.backendExtras,
-  };
+  const patch = validateRuntimeOptionPatch(params.patch);
   return normalizeRuntimeOptions({
     ...current,
     ...patch,
-    ...(Object.keys(mergedExtras).length > 0 ? { backendExtras: mergedExtras } : {}),
+    ...(patch.backendExtras
+      ? { backendExtras: { ...current.backendExtras, ...patch.backendExtras } }
+      : {}),
+  });
+}
+
+export function isThinkingConfigKey(key: string): boolean {
+  return RUNTIME_CONFIG_OPTION_ALIASES.thinking.some(
+    (alias) => alias === normalizeLowercaseStringOrEmpty(key),
+  );
+}
+
+/** Reconcile only selected thinking; backend defaults must not become new session overrides. */
+export function reconcileAcceptedRuntimeOptions(
+  options: AcpSessionRuntimeOptions,
+  result: AcpRuntimeConfigOptionResult | void,
+  pendingThinking?: string,
+): AcpSessionRuntimeOptions {
+  if (!result || !options.thinking) {
+    return options;
+  }
+  const thinking = result.configOptions.find(
+    (option) => option.category === "thought_level" || isThinkingConfigKey(option.id),
+  );
+  // Automatic model replay precedes thinking; a still-valid pending selection must survive it.
+  if (
+    pendingThinking &&
+    (thinking?.currentValue === pendingThinking ||
+      thinking?.options?.some((choice) =>
+        "options" in choice
+          ? choice.options.some((option) => option.value === pendingThinking)
+          : choice.value === pendingThinking,
+      ))
+  ) {
+    return options;
+  }
+  return normalizeRuntimeOptions({
+    ...options,
+    thinking: typeof thinking?.currentValue === "string" ? thinking.currentValue : undefined,
   });
 }
 
@@ -291,6 +324,7 @@ export function buildRuntimeControlSignature(options: AcpSessionRuntimeOptions):
   return JSON.stringify({
     runtimeMode: normalized.runtimeMode ?? null,
     model: normalized.model ?? null,
+    thinking: normalized.thinking ?? null,
     permissionProfile: normalized.permissionProfile ?? null,
     timeoutSeconds: normalized.timeoutSeconds ?? null,
     backendExtras: extras,
@@ -299,24 +333,92 @@ export function buildRuntimeControlSignature(options: AcpSessionRuntimeOptions):
 
 export function buildRuntimeConfigOptionPairs(
   options: AcpSessionRuntimeOptions,
+  advertisedConfigOptionKeys?: readonly string[],
 ): Array<[string, string]> {
   const normalized = normalizeRuntimeOptions(options);
   const pairs = new Map<string, string>();
+  const advertisedKeys = buildAdvertisedConfigOptionKeyMap(advertisedConfigOptionKeys);
+  const resolveKey = (key: string) => resolveRuntimeConfigOptionKeyFromMap(key, advertisedKeys);
+  const shouldEmit = (aliases: readonly string[]) =>
+    advertisedKeys.size === 0 || aliases.some((alias) => advertisedKeys.has(alias));
   if (normalized.model) {
-    pairs.set("model", normalized.model);
+    pairs.set(resolveKey("model"), normalized.model);
+  }
+  if (normalized.thinking && shouldEmit(RUNTIME_CONFIG_OPTION_ALIASES.thinking)) {
+    pairs.set(resolveKey("thinking"), normalized.thinking);
   }
   if (normalized.permissionProfile) {
-    pairs.set("approval_policy", normalized.permissionProfile);
+    pairs.set(resolveKey("approval_policy"), normalized.permissionProfile);
   }
-  if (typeof normalized.timeoutSeconds === "number") {
-    pairs.set("timeout", String(normalized.timeoutSeconds));
+  if (
+    typeof normalized.timeoutSeconds === "number" &&
+    shouldEmit(RUNTIME_CONFIG_OPTION_ALIASES.timeoutSeconds)
+  ) {
+    pairs.set(resolveKey("timeout"), String(normalized.timeoutSeconds));
   }
   for (const [key, value] of Object.entries(normalized.backendExtras ?? {})) {
-    if (!pairs.has(key)) {
-      pairs.set(key, value);
+    const wireKey = resolveKey(key);
+    if (!pairs.has(wireKey)) {
+      pairs.set(wireKey, value);
     }
   }
   return [...pairs.entries()];
+}
+
+function buildAdvertisedConfigOptionKeyMap(
+  advertisedConfigOptionKeys?: readonly string[],
+): Map<string, string> {
+  const advertisedKeys = new Map<string, string>();
+  for (const rawKey of advertisedConfigOptionKeys ?? []) {
+    const key = normalizeText(rawKey);
+    const normalizedKey = normalizeLowercaseStringOrEmpty(key);
+    if (key && normalizedKey && !advertisedKeys.has(normalizedKey)) {
+      advertisedKeys.set(normalizedKey, key);
+    }
+  }
+  return advertisedKeys;
+}
+
+function resolveRuntimeConfigOptionAliases(key: string): readonly string[] {
+  const normalizedKey = normalizeLowercaseStringOrEmpty(key);
+  for (const aliases of Object.values(RUNTIME_CONFIG_OPTION_ALIASES)) {
+    if (aliases.some((alias) => alias === normalizedKey)) {
+      return aliases;
+    }
+  }
+  return [key];
+}
+
+export function resolveRuntimeConfigOptionKey(
+  key: string,
+  advertisedConfigOptionKeys?: readonly string[],
+): string {
+  return resolveRuntimeConfigOptionKeyFromMap(
+    key,
+    buildAdvertisedConfigOptionKeyMap(advertisedConfigOptionKeys),
+  );
+}
+
+function resolveRuntimeConfigOptionKeyFromMap(
+  key: string,
+  advertisedKeys: ReadonlyMap<string, string>,
+): string {
+  const normalizedKey = normalizeText(key) ?? "";
+  const normalizedLookupKey = normalizeLowercaseStringOrEmpty(normalizedKey);
+  if (!normalizedKey || advertisedKeys.size === 0) {
+    return normalizedKey;
+  }
+  const exactAdvertisedKey = advertisedKeys.get(normalizedLookupKey);
+  if (exactAdvertisedKey) {
+    return exactAdvertisedKey;
+  }
+  for (const alias of resolveRuntimeConfigOptionAliases(normalizedKey)) {
+    const advertisedAlias = advertisedKeys.get(normalizeLowercaseStringOrEmpty(alias));
+    if (advertisedAlias) {
+      return advertisedAlias;
+    }
+  }
+  return normalizedKey;
 }
 
 export function inferRuntimeOptionPatchFromConfigOption(
@@ -324,18 +426,17 @@ export function inferRuntimeOptionPatchFromConfigOption(
   value: string,
 ): Partial<AcpSessionRuntimeOptions> {
   const validated = validateRuntimeConfigOptionInput(key, value);
-  const normalizedKey = validated.key.toLowerCase();
+  const normalizedKey = normalizeLowercaseStringOrEmpty(validated.key);
   if (normalizedKey === "model") {
     return { model: validateRuntimeModelInput(validated.value) };
   }
-  if (
-    normalizedKey === "approval_policy" ||
-    normalizedKey === "permission_profile" ||
-    normalizedKey === "permissions"
-  ) {
+  if (isThinkingConfigKey(normalizedKey)) {
+    return { thinking: validateRuntimeThinkingInput(validated.value) };
+  }
+  if (RUNTIME_CONFIG_OPTION_ALIASES.permissionProfile.some((alias) => alias === normalizedKey)) {
     return { permissionProfile: validateRuntimePermissionProfileInput(validated.value) };
   }
-  if (normalizedKey === "timeout" || normalizedKey === "timeout_seconds") {
+  if (RUNTIME_CONFIG_OPTION_ALIASES.timeoutSeconds.some((alias) => alias === normalizedKey)) {
     return { timeoutSeconds: parseRuntimeTimeoutSecondsInput(validated.value) };
   }
   if (normalizedKey === "cwd") {

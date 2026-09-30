@@ -1,65 +1,42 @@
-import { emptyPluginConfigSchema, type OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-auth";
+import { buildOpenAICompatibleProviderFamilyCatalog } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
+import { readManifestProviderDefaultModelRef } from "openclaw/plugin-sdk/provider-catalog-shared";
+import { defineSingleProviderPluginEntry } from "openclaw/plugin-sdk/provider-entry";
 import { ensureModelAllowlistEntry } from "openclaw/plugin-sdk/provider-onboard";
-import { buildDoubaoCodingProvider, buildDoubaoProvider } from "./provider-catalog.js";
+import { applyVolcengineToolSchemaCompat } from "./api.js";
+import { VOLCENGINE_PROVIDER_CATALOG } from "./models.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
+import { buildVolcengineSpeechProvider } from "./speech-provider.js";
 
 const PROVIDER_ID = "volcengine";
-const VOLCENGINE_DEFAULT_MODEL_REF = "volcengine-plan/ark-code-latest";
+const VOLCENGINE_DEFAULT_MODEL_REF = readManifestProviderDefaultModelRef(
+  manifest,
+  "volcengine-plan",
+)!;
 
-const volcenginePlugin = {
+export default defineSingleProviderPluginEntry({
   id: PROVIDER_ID,
   name: "Volcengine Provider",
   description: "Bundled Volcengine provider plugin",
-  configSchema: emptyPluginConfigSchema(),
-  register(api: OpenClawPluginApi) {
-    api.registerProvider({
-      id: PROVIDER_ID,
-      label: "Volcengine",
-      docsPath: "/concepts/model-providers#volcano-engine-doubao",
-      envVars: ["VOLCANO_ENGINE_API_KEY"],
-      auth: [
-        createProviderApiKeyAuthMethod({
-          providerId: PROVIDER_ID,
-          methodId: "api-key",
-          label: "Volcano Engine API key",
-          hint: "API key",
-          optionKey: "volcengineApiKey",
-          flagName: "--volcengine-api-key",
-          envVar: "VOLCANO_ENGINE_API_KEY",
-          promptMessage: "Enter Volcano Engine API key",
-          defaultModel: VOLCENGINE_DEFAULT_MODEL_REF,
-          expectedProviders: ["volcengine"],
-          applyConfig: (cfg) =>
-            ensureModelAllowlistEntry({
-              cfg,
-              modelRef: VOLCENGINE_DEFAULT_MODEL_REF,
-            }),
-          wizard: {
-            choiceId: "volcengine-api-key",
-            choiceLabel: "Volcano Engine API key",
-            groupId: "volcengine",
-            groupLabel: "Volcano Engine",
-            groupHint: "API key",
-          },
-        }),
-      ],
-      catalog: {
-        order: "paired",
-        run: async (ctx) => {
-          const apiKey = ctx.resolveProviderApiKey(PROVIDER_ID).apiKey;
-          if (!apiKey) {
-            return null;
-          }
-          return {
-            providers: {
-              volcengine: { ...buildDoubaoProvider(), apiKey },
-              "volcengine-plan": { ...buildDoubaoCodingProvider(), apiKey },
-            },
-          };
-        },
-      },
-    });
+  manifest,
+  provider: {
+    label: "Volcengine",
+    docsPath: "/concepts/model-providers#volcano-engine-doubao",
+    hookAliases: ["volcengine-plan"],
+    manifestAuth: {
+      defaultModel: VOLCENGINE_DEFAULT_MODEL_REF,
+      applyConfig: (cfg) =>
+        ensureModelAllowlistEntry({ cfg, modelRef: VOLCENGINE_DEFAULT_MODEL_REF }),
+    },
+    ...buildOpenAICompatibleProviderFamilyCatalog({
+      discoveryMode: "strict",
+      credentialProviderId: PROVIDER_ID,
+      entries: VOLCENGINE_PROVIDER_CATALOG.entries,
+      staticCatalog: VOLCENGINE_PROVIDER_CATALOG.staticCatalog,
+      augmentModelCatalog: VOLCENGINE_PROVIDER_CATALOG.augmentModelCatalog,
+    }),
+    normalizeResolvedModel: ({ model }) => applyVolcengineToolSchemaCompat(model),
   },
-};
-
-export default volcenginePlugin;
+  register(api) {
+    api.registerSpeechProvider(buildVolcengineSpeechProvider());
+  },
+});

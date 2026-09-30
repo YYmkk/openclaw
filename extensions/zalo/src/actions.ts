@@ -1,38 +1,42 @@
+import { jsonResult, readStringParam } from "openclaw/plugin-sdk/channel-actions";
 import type {
   ChannelMessageActionAdapter,
   ChannelMessageActionName,
-  OpenClawConfig,
-} from "openclaw/plugin-sdk/zalo";
-import { extractToolSend, jsonResult, readStringParam } from "openclaw/plugin-sdk/zalo";
-import { listEnabledZaloAccounts } from "./accounts.js";
+} from "openclaw/plugin-sdk/channel-contract";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { createLazyRuntimeNamedExport } from "openclaw/plugin-sdk/lazy-runtime";
+import { extractToolSend } from "openclaw/plugin-sdk/tool-send";
+import { inspectZaloAccount, listZaloAccountIds } from "./accounts.js";
 
-let zaloActionsRuntimePromise: Promise<typeof import("./actions.runtime.js")> | null = null;
-
-async function loadZaloActionsRuntime() {
-  zaloActionsRuntimePromise ??= import("./actions.runtime.js");
-  return zaloActionsRuntimePromise;
-}
+const loadZaloActionsRuntime = createLazyRuntimeNamedExport(
+  () => import("./send.js"),
+  "sendMessageZalo",
+);
 
 const providerId = "zalo";
+const ZALO_ACTIONS = new Set<ChannelMessageActionName>(["send"]);
 
-function listEnabledAccounts(cfg: OpenClawConfig) {
-  return listEnabledZaloAccounts(cfg).filter(
-    (account) => account.enabled && account.tokenSource !== "none",
-  );
+function listEnabledAccounts(cfg: OpenClawConfig, accountId?: string | null) {
+  return (
+    accountId
+      ? [inspectZaloAccount({ cfg, accountId })]
+      : listZaloAccountIds(cfg).map((listedAccountId) =>
+          inspectZaloAccount({ cfg, accountId: listedAccountId }),
+        )
+  ).filter((account) => account.enabled && account.tokenStatus === "available");
 }
 
 export const zaloMessageActions: ChannelMessageActionAdapter = {
-  listActions: ({ cfg }) => {
-    const accounts = listEnabledAccounts(cfg);
+  describeMessageTool: ({ cfg, accountId }) => {
+    const accounts = listEnabledAccounts(cfg, accountId);
     if (accounts.length === 0) {
-      return [];
+      return null;
     }
-    const actions = new Set<ChannelMessageActionName>(["send"]);
-    return Array.from(actions);
+    return { actions: Array.from(ZALO_ACTIONS), capabilities: [] };
   },
-  getCapabilities: () => [],
+  supportsAction: ({ action }) => ZALO_ACTIONS.has(action),
   extractToolSend: ({ args }) => extractToolSend(args, "sendMessage"),
-  handleAction: async ({ action, params, cfg, accountId }) => {
+  handleAction: async ({ action, params, cfg, accountId, assertDirectAdapterHandoff }) => {
     if (action === "send") {
       const to = readStringParam(params, "to", { required: true });
       const content = readStringParam(params, "message", {
@@ -41,11 +45,12 @@ export const zaloMessageActions: ChannelMessageActionAdapter = {
       });
       const mediaUrl = readStringParam(params, "media", { trim: false });
 
-      const { sendMessageZalo } = await loadZaloActionsRuntime();
+      const sendMessageZalo = await loadZaloActionsRuntime();
       const result = await sendMessageZalo(to ?? "", content ?? "", {
         accountId: accountId ?? undefined,
         mediaUrl: mediaUrl ?? undefined,
-        cfg: cfg,
+        cfg,
+        assertDirectAdapterHandoff,
       });
 
       if (!result.ok) {

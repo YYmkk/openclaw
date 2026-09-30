@@ -1,55 +1,109 @@
 import {
+  createDetectedBinaryStatus,
   setSetupChannelEnabled,
   type ChannelSetupWizard,
 } from "openclaw/plugin-sdk/setup";
-import { detectBinary } from "../../../src/plugins/setup-binary.js";
-import { listIMessageAccountIds, resolveIMessageAccount } from "./accounts.js";
+import { detectBinary } from "openclaw/plugin-sdk/setup-tools";
+import { resolveIMessageAccount } from "./accounts.js";
+import { installIMessageCli } from "./install-imsg.js";
 import {
   createIMessageCliPathTextInput,
+  IMESSAGE_INSTALL_COMMAND,
+  isAutoManagedIMessageCliPath,
   imessageCompletionNote,
   imessageDmPolicy,
-  imessageSetupAdapter,
+  imessageSetupStatusBase,
+  normalizeIMessageCliPathForSetup,
   parseIMessageAllowFromEntries,
 } from "./setup-core.js";
 
 const channel = "imessage" as const;
 
+const imessageDetectedBinaryStatus = createDetectedBinaryStatus({
+  channelLabel: "iMessage",
+  binaryLabel: "imsg",
+  ...imessageSetupStatusBase,
+  resolveBinaryPath: ({ cfg, accountId }) =>
+    resolveIMessageAccount({ cfg, accountId }).config.cliPath ?? "imsg",
+  detectBinary,
+});
+
 export const imessageSetupWizard: ChannelSetupWizard = {
   channel,
   status: {
-    configuredLabel: "configured",
-    unconfiguredLabel: "needs setup",
-    configuredHint: "imsg found",
-    unconfiguredHint: "imsg missing",
-    configuredScore: 1,
-    unconfiguredScore: 0,
-    resolveConfigured: ({ cfg }) =>
-      listIMessageAccountIds(cfg).some((accountId) => {
-        const account = resolveIMessageAccount({ cfg, accountId });
-        return Boolean(
-          account.config.cliPath ||
-          account.config.dbPath ||
-          account.config.allowFrom ||
-          account.config.service ||
-          account.config.region,
+    ...imessageDetectedBinaryStatus,
+    async resolveStatusLines(params) {
+      const lines = (await imessageDetectedBinaryStatus.resolveStatusLines?.(params)) ?? [];
+      const configuredCliPath = resolveIMessageAccount({
+        cfg: params.cfg,
+        accountId: params.accountId,
+      }).config.cliPath;
+      const cliPath = configuredCliPath ?? "imsg";
+      if (await detectBinary(cliPath)) {
+        return lines;
+      }
+      const hint = isAutoManagedIMessageCliPath(cliPath, {
+        explicit: configuredCliPath !== undefined,
+      })
+        ? `Install imsg on the Messages Mac: ${IMESSAGE_INSTALL_COMMAND}`
+        : `imsg command not found (${cliPath}). Check the configured cliPath or wrapper.`;
+      return [...lines, hint];
+    },
+  },
+  prepare: async ({ cfg, accountId, credentialValues, runtime, prompter, options }) => {
+    if (!options?.allowIMessageInstall || process.platform !== "darwin") {
+      return undefined;
+    }
+    const credentialCliPath =
+      typeof credentialValues.cliPath === "string" ? credentialValues.cliPath : undefined;
+    const configuredCliPath = resolveIMessageAccount({ cfg, accountId }).config.cliPath;
+    const explicitCliPath = credentialCliPath ?? configuredCliPath;
+    const currentCliPath = explicitCliPath ?? "imsg";
+    const normalizedCliPath = normalizeIMessageCliPathForSetup(currentCliPath);
+    if (
+      !isAutoManagedIMessageCliPath(normalizedCliPath, {
+        explicit: explicitCliPath !== undefined,
+      })
+    ) {
+      return undefined;
+    }
+    const cliDetected = await detectBinary(normalizedCliPath);
+    const wantsInstall = await prompter.confirm({
+      message: cliDetected
+        ? "imsg detected. Reinstall/update now?"
+        : "imsg not found. Install now?",
+      initialValue: !cliDetected,
+    });
+    if (!wantsInstall) {
+      return undefined;
+    }
+    try {
+      await options?.beforePersistentEffect?.();
+      const result = await installIMessageCli(runtime, {
+        upgrade: cliDetected,
+        cliPath: normalizedCliPath,
+      });
+      if (result.ok && result.cliPath) {
+        await prompter.note(`Installed imsg at ${result.cliPath}`, "iMessage");
+        return {
+          credentialValues: {
+            cliPath: result.cliPath,
+          },
+        };
+      }
+      if (result.ok) {
+        await prompter.note(
+          `Using existing imsg at ${normalizedCliPath}; Homebrew does not manage this binary.`,
+          "iMessage",
         );
-      }),
-    resolveStatusLines: async ({ cfg, configured }) => {
-      const cliPath = cfg.channels?.imessage?.cliPath ?? "imsg";
-      const cliDetected = await detectBinary(cliPath);
-      return [
-        `iMessage: ${configured ? "configured" : "needs setup"}`,
-        `imsg: ${cliDetected ? "found" : "missing"} (${cliPath})`,
-      ];
-    },
-    resolveSelectionHint: async ({ cfg }) => {
-      const cliPath = cfg.channels?.imessage?.cliPath ?? "imsg";
-      return (await detectBinary(cliPath)) ? "imsg found" : "imsg missing";
-    },
-    resolveQuickstartScore: async ({ cfg }) => {
-      const cliPath = cfg.channels?.imessage?.cliPath ?? "imsg";
-      return (await detectBinary(cliPath)) ? 1 : 0;
-    },
+      }
+      if (!result.ok) {
+        await prompter.note(result.error ?? "imsg install failed.", "iMessage");
+      }
+    } catch (error) {
+      await prompter.note(`imsg install failed: ${String(error)}`, "iMessage");
+    }
+    return undefined;
   },
   credentials: [],
   textInputs: [
@@ -62,4 +116,4 @@ export const imessageSetupWizard: ChannelSetupWizard = {
   disable: (cfg) => setSetupChannelEnabled(cfg, channel, false),
 };
 
-export { imessageSetupAdapter, parseIMessageAllowFromEntries };
+export { parseIMessageAllowFromEntries };

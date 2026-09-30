@@ -1,82 +1,76 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+/**
+ * Regression coverage for plugin tool context and delivery metadata.
+ * Verifies requester metadata, workspace selection, and delivery routing.
+ */
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+import {
+  resolveOpenClawPluginToolInputs,
+  type OpenClawPluginToolOptions,
+} from "./openclaw-tools.plugin-context.js";
 
-const { resolvePluginToolsMock } = vi.hoisted(() => ({
-  resolvePluginToolsMock: vi.fn((params?: unknown) => {
-    void params;
-    return [];
-  }),
-}));
+function resolve(options: OpenClawPluginToolOptions) {
+  return resolveOpenClawPluginToolInputs({ options: { config: {}, ...options } });
+}
 
-vi.mock("../plugins/tools.js", () => ({
-  resolvePluginTools: resolvePluginToolsMock,
-  getPluginToolMeta: vi.fn(() => undefined),
-}));
-
-import { createOpenClawTools } from "./openclaw-tools.js";
-import { createOpenClawCodingTools } from "./pi-tools.js";
-
-describe("createOpenClawTools plugin context", () => {
-  beforeEach(() => {
-    resolvePluginToolsMock.mockClear();
-  });
-
-  it("forwards trusted requester sender identity to plugin tool context", () => {
-    createOpenClawTools({
-      config: {} as never,
-      requesterSenderId: "trusted-sender",
-      senderIsOwner: true,
+describe("openclaw plugin tool context", () => {
+  it("forwards runtime-owned active model metadata", () => {
+    const result = resolve({
+      modelProvider: " local-provider ",
+      modelId: " local-model ",
     });
 
-    expect(resolvePluginToolsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        context: expect.objectContaining({
-          requesterSenderId: "trusted-sender",
-          senderIsOwner: true,
-        }),
-      }),
-    );
+    expect(result.context.activeModel).toStrictEqual({
+      provider: "local-provider",
+      modelId: "local-model",
+      modelRef: "local-provider/local-model",
+    });
   });
 
-  it("forwards ephemeral sessionId to plugin tool context", () => {
-    createOpenClawTools({
-      config: {} as never,
-      agentSessionKey: "agent:main:telegram:direct:12345",
-      sessionId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  it("does not duplicate provider-qualified active model refs", () => {
+    const result = resolve({
+      modelProvider: "openrouter",
+      modelId: "openrouter/auto",
     });
 
-    expect(resolvePluginToolsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        context: expect.objectContaining({
-          sessionKey: "agent:main:telegram:direct:12345",
-          sessionId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-        }),
-      }),
-    );
+    expect(result.context.activeModel).toStrictEqual({
+      provider: "openrouter",
+      modelId: "openrouter/auto",
+      modelRef: "openrouter/auto",
+    });
   });
 
-  it("forwards gateway subagent binding for plugin tools", () => {
-    createOpenClawTools({
-      config: {} as never,
-      allowGatewaySubagentBinding: true,
+  it("uses requester agent override for synthetic embedded session keys", () => {
+    const recallWorkspace = path.join(process.cwd(), "tmp-recall-workspace");
+    const config = {
+      agents: {
+        defaults: { workspace: path.join(process.cwd(), "tmp-default-workspace") },
+        list: [
+          { id: "main", default: true },
+          { id: "recall", workspace: recallWorkspace },
+        ],
+      },
+    } as never;
+    const result = resolveOpenClawPluginToolInputs({
+      options: {
+        config,
+        agentSessionKey: "explicit:user-session:active-memory:abc123",
+        requesterAgentIdOverride: "recall",
+      },
+      resolvedConfig: config,
     });
 
-    expect(resolvePluginToolsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        allowGatewaySubagentBinding: true,
-      }),
-    );
+    expect(result.context.agentId).toBe("recall");
+    expect(result.context.workspaceDir).toBe(recallWorkspace);
   });
 
-  it("forwards gateway subagent binding through coding tools", () => {
-    createOpenClawCodingTools({
-      config: {} as never,
-      allowGatewaySubagentBinding: true,
+  it("keeps the routable conversation target ahead of the native channel id", () => {
+    const result = resolve({
+      agentChannel: "slack",
+      currentMessagingTarget: "user:U123",
+      currentChannelId: "D123",
     });
 
-    expect(resolvePluginToolsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        allowGatewaySubagentBinding: true,
-      }),
-    );
+    expect(result.context.deliveryContext?.to).toBe("user:U123");
   });
 });

@@ -1,33 +1,15 @@
-import {
-  buildVeniceModelDefinition,
-  VENICE_BASE_URL,
-  VENICE_DEFAULT_MODEL_REF,
-  VENICE_MODEL_CATALOG,
-} from "openclaw/plugin-sdk/provider-models";
-import {
-  applyAgentDefaultModelPrimary,
-  applyProviderConfigWithModelCatalog,
-  type OpenClawConfig,
-} from "openclaw/plugin-sdk/provider-onboard";
+// Venice setup module handles plugin onboarding behavior.
+import { createModelCatalogPresetAppliers } from "openclaw/plugin-sdk/provider-onboard";
+import { VENICE_BASE_URL, VENICE_DEFAULT_MODEL_REF, VENICE_MODEL_CATALOG } from "./api.js";
 
-export { VENICE_DEFAULT_MODEL_REF };
-
-export function applyVeniceProviderConfig(cfg: OpenClawConfig): OpenClawConfig {
-  const models = { ...cfg.agents?.defaults?.models };
-  models[VENICE_DEFAULT_MODEL_REF] = {
-    ...models[VENICE_DEFAULT_MODEL_REF],
-    alias: models[VENICE_DEFAULT_MODEL_REF]?.alias ?? "Kimi K2.5",
-  };
-
-  return applyProviderConfigWithModelCatalog(cfg, {
-    agentModels: models,
+export const { applyConfig: applyVeniceConfig } = createModelCatalogPresetAppliers<[]>({
+  primaryModelRef: VENICE_DEFAULT_MODEL_REF,
+  resolveParams: (cfg) => ({
     providerId: "venice",
     api: "openai-completions",
     baseUrl: VENICE_BASE_URL,
-    catalogModels: VENICE_MODEL_CATALOG.map(buildVeniceModelDefinition),
-  });
-}
-
-export function applyVeniceConfig(cfg: OpenClawConfig): OpenClawConfig {
-  return applyAgentDefaultModelPrimary(applyVeniceProviderConfig(cfg), VENICE_DEFAULT_MODEL_REF);
-}
+    // Replace mode skips discovery; merge mode must not persist generated pricing as authored pins.
+    catalogModels: cfg.models?.mode === "replace" ? structuredClone(VENICE_MODEL_CATALOG) : [],
+    aliases: [{ modelRef: VENICE_DEFAULT_MODEL_REF, alias: "GLM 4.7" }],
+  }),
+});

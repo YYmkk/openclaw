@@ -1,48 +1,234 @@
-import { buildAccountScopedAllowlistConfigEditor } from "openclaw/plugin-sdk/allowlist-config-edit";
+import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
+import { buildDmGroupAccountAllowlistAdapter } from "openclaw/plugin-sdk/allowlist-config-edit";
+import type { ChannelApprovalKind } from "openclaw/plugin-sdk/approval-handler-runtime";
+import { formatTrimmedAllowFromEntries } from "openclaw/plugin-sdk/channel-config-helpers";
+import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import {
-  buildAccountScopedDmSecurityPolicy,
-  collectAllowlistProviderRestrictSendersWarnings,
-} from "openclaw/plugin-sdk/channel-config-helpers";
-import { resolveOutboundSendDep } from "openclaw/plugin-sdk/channel-runtime";
+  createMessageReceiptFromOutboundResults,
+  defineChannelMessageAdapter,
+  type ChannelMessageSendResult,
+  type MessageReceiptPartKind,
+  sanitizeForPlainText,
+} from "openclaw/plugin-sdk/channel-outbound";
+import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-send-result";
+import { PAIRING_APPROVED_MESSAGE } from "openclaw/plugin-sdk/channel-status";
+import { buildPassiveProbedChannelStatusSummary } from "openclaw/plugin-sdk/extension-shared";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import { questionGatewayRuntime } from "openclaw/plugin-sdk/question-gateway-runtime";
+import { chunkMarkdownText } from "openclaw/plugin-sdk/reply-runtime";
+import { buildOutboundBaseSessionKey, type RoutePeer } from "openclaw/plugin-sdk/routing";
 import {
   collectStatusIssuesFromLastError,
-  DEFAULT_ACCOUNT_ID,
-  formatTrimmedAllowFromEntries,
-  looksLikeIMessageTargetId,
-  normalizeIMessageMessagingTarget,
+  createComputedAccountStatusAdapter,
+  createDefaultChannelRuntimeState,
+} from "openclaw/plugin-sdk/status-helpers";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveIMessageAccount, type ResolvedIMessageAccount } from "./accounts.js";
+import { imessageMessageActions } from "./actions.js";
+import {
+  imessageApprovalCapability,
+  shouldSuppressLocalIMessageExecApprovalPrompt,
+} from "./approval-native.js";
+import { resolveIMessageDirectChatService } from "./chat-context.js";
+import { createIMessageConversationBindingManager } from "./conversation-bindings.js";
+import {
+  matchIMessageAcpConversation,
+  normalizeIMessageAcpConversationId,
+  resolveIMessageConversationIdFromTarget,
+} from "./conversation-id.js";
+import { imessageDoctor } from "./doctor.js";
+import {
   resolveIMessageGroupRequireMention,
   resolveIMessageGroupToolPolicy,
-  type ChannelPlugin,
-} from "openclaw/plugin-sdk/imessage";
-import { buildAgentSessionKey, type RoutePeer } from "openclaw/plugin-sdk/routing";
-import { buildPassiveProbedChannelStatusSummary } from "../../shared/channel-status-summary.js";
-import { resolveIMessageAccount, type ResolvedIMessageAccount } from "./accounts.js";
-import { getIMessageRuntime } from "./runtime.js";
-import { imessageSetupAdapter } from "./setup-core.js";
-import { createIMessagePluginBase, imessageSetupWizard } from "./shared.js";
-import { normalizeIMessageHandle, parseIMessageTarget } from "./targets.js";
+} from "./group-policy.js";
+import {
+  sanitizeIMessageFinalOutboundText,
+  sanitizeOutboundText,
+} from "./monitor/sanitize-outbound.js";
+import { normalizeIMessageMessagingTarget } from "./normalize.js";
+import type { IMessageProbe } from "./probe.js";
+import { imessageSetupContract } from "./setup-core.js";
+import {
+  createIMessagePluginBase,
+  imessageSecurityAdapter,
+  imessageSetupWizard,
+} from "./shared.js";
+import { isIMessagePhoneLikeHandle } from "./target-identifiers.js";
+import {
+  inferIMessageTargetChatType,
+  looksLikeIMessageExplicitTargetId,
+  normalizeIMessageHandle,
+  parseIMessageTarget,
+} from "./targets.js";
 
-let imessageChannelRuntimePromise: Promise<typeof import("./channel.runtime.js")> | null = null;
+const loadIMessageChannelRuntime = createLazyRuntimeModule(() => import("./channel.runtime.js"));
 
-async function loadIMessageChannelRuntime() {
-  imessageChannelRuntimePromise ??= import("./channel.runtime.js");
-  return imessageChannelRuntimePromise;
+type IMessageMessageContextExtras = {
+  deps?: { [channelId: string]: unknown };
+  conversationReadOrigin?: "delegated" | "direct-operator";
+};
+
+type IMessageOutboundContext = Omit<
+  Parameters<NonNullable<ChannelOutboundAdapter["sendMedia"]>>[0],
+  "onDeliveryResult"
+>;
+type IMessageOutboundOptions = Pick<
+  Parameters<Awaited<ReturnType<typeof loadIMessageChannelRuntime>>["sendIMessageOutbound"]>[0],
+  "conversationReadOrigin" | "onDeliveryResult"
+>;
+
+async function sendIMessageOutbound(
+  ctx: IMessageOutboundContext,
+  kind: "text" | "media",
+  options: IMessageOutboundOptions = {},
+) {
+  return await (
+    await loadIMessageChannelRuntime()
+  ).sendIMessageOutbound({
+    cfg: ctx.cfg,
+    to: ctx.to,
+    text: ctx.text,
+    accountId: ctx.accountId ?? undefined,
+    deps: ctx.deps,
+    replyToId: ctx.replyToId ?? undefined,
+    assertDirectAdapterHandoff: ctx.assertDirectAdapterHandoff,
+    onPlatformSendDispatch: ctx.onPlatformSendDispatch,
+    ...options,
+    ...(kind === "media"
+      ? {
+          mediaUrl: ctx.mediaUrl,
+          mediaAccess: ctx.mediaAccess,
+          mediaLocalRoots: ctx.mediaLocalRoots,
+          mediaReadFile: ctx.mediaReadFile,
+          audioAsVoice: ctx.audioAsVoice,
+        }
+      : {}),
+  });
 }
 
-function buildIMessageBaseSessionKey(params: {
-  cfg: Parameters<typeof resolveIMessageAccount>[0]["cfg"];
-  agentId: string;
-  accountId?: string | null;
-  peer: RoutePeer;
-}) {
-  return buildAgentSessionKey({
-    agentId: params.agentId,
-    channel: "imessage",
-    accountId: params.accountId,
-    peer: params.peer,
-    dmScope: params.cfg.session?.dmScope ?? "main",
-    identityLinks: params.cfg.session?.identityLinks,
+function toIMessageMessageSendResult(
+  result: {
+    messageId?: string;
+    meta?: Record<string, unknown>;
+    receipt?: ChannelMessageSendResult["receipt"];
+  },
+  kind: MessageReceiptPartKind,
+  replyToId?: string | null,
+): ChannelMessageSendResult & { meta?: Record<string, unknown> } {
+  const receipt =
+    result.receipt ??
+    createMessageReceiptFromOutboundResults({
+      results: result.messageId ? [{ channel: "imessage", messageId: result.messageId }] : [],
+      kind,
+      ...(replyToId ? { replyToId } : {}),
+    });
+  return {
+    messageId: result.messageId || receipt.primaryPlatformMessageId,
+    receipt,
+    ...(result.meta && Object.keys(result.meta).length > 0 ? { meta: result.meta } : {}),
+  };
+}
+
+const loadIMessageApprovalReactionsModule = createLazyRuntimeModule(
+  () => import("./approval-reactions.js"),
+);
+const loadIMessageQuestionReactionsModule = createLazyRuntimeModule(
+  () => import("./question-reactions.js"),
+);
+
+async function prepareForwardedIMessageApprovalPayload(params: {
+  payload: Parameters<NonNullable<ChannelOutboundAdapter["beforeDeliverPayload"]>>[0]["payload"];
+  approvalKind: ChannelApprovalKind;
+}): Promise<void> {
+  const prepared = (
+    await loadIMessageApprovalReactionsModule()
+  ).addIMessageApprovalReactionHintToStructuredPayload(params);
+  if (prepared) {
+    Object.assign(params.payload, prepared);
+  }
+}
+
+async function registerDeliveredIMessageApprovalPayload(
+  params: Parameters<NonNullable<ChannelOutboundAdapter["afterDeliverPayload"]>>[0],
+): Promise<void> {
+  const accountId = resolveIMessageAccount({
+    cfg: params.cfg,
+    accountId: params.target.accountId,
+  }).accountId;
+  (
+    await loadIMessageQuestionReactionsModule()
+  ).registerIMessageQuestionReactionTargetForDeliveredPayload({
+    accountId,
+    target: params.target,
+    payload: params.payload,
+    results: params.results,
   });
+  await (
+    await loadIMessageApprovalReactionsModule()
+  ).registerIMessageApprovalReactionTargetForDeliveredPayload({
+    accountId,
+    target: params.target,
+    payload: params.payload,
+    results: params.results,
+  });
+}
+
+const imessageMessageAdapter = defineChannelMessageAdapter({
+  id: "imessage",
+  durableFinal: {
+    capabilities: {
+      text: true,
+      media: true,
+      replyTo: true,
+      messageSendingHooks: true,
+    },
+  },
+  send: {
+    text: async (ctx) => {
+      const result = await sendIMessageOutbound(ctx, "text", {
+        conversationReadOrigin: (ctx as typeof ctx & IMessageMessageContextExtras)
+          .conversationReadOrigin,
+      });
+      return toIMessageMessageSendResult(result, "text", ctx.replyToId);
+    },
+    media: async (ctx) => {
+      const result = await sendIMessageOutbound(ctx, "media", {
+        conversationReadOrigin: (ctx as typeof ctx & IMessageMessageContextExtras)
+          .conversationReadOrigin,
+        ...(ctx.onDeliveryResult
+          ? {
+              onDeliveryResult: async (acceptedResult) => {
+                await ctx.onDeliveryResult?.(
+                  toIMessageMessageSendResult(
+                    acceptedResult,
+                    ctx.audioAsVoice ? "voice" : "media",
+                    ctx.replyToId,
+                  ),
+                );
+              },
+            }
+          : {}),
+      });
+      return toIMessageMessageSendResult(
+        result,
+        ctx.audioAsVoice ? "voice" : "media",
+        ctx.replyToId,
+      );
+    },
+  },
+});
+
+function isCanonicalIMessageDirectHandle(raw: string, normalized: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed || !normalized) {
+    return false;
+  }
+  // Inbound DMs key sessions by normalized phone number or email. Names and
+  // other bridge aliases can deliver, but cannot prove the reply identity.
+  if (normalized.startsWith("+")) {
+    return isIMessagePhoneLikeHandle(trimmed);
+  }
+  return /^[^\s@<>()[\]`]+@[^\s@<>()[\]`]+\.[^\s@<>()[\]`]+$/.test(trimmed);
 }
 
 function resolveIMessageOutboundSessionRoute(params: {
@@ -52,198 +238,290 @@ function resolveIMessageOutboundSessionRoute(params: {
   target: string;
 }) {
   const parsed = parseIMessageTarget(params.target);
+  let peer: RoutePeer;
+  let from: string;
+  let to: string;
+  let recipientSessionExact = false;
   if (parsed.kind === "handle") {
     const handle = normalizeIMessageHandle(parsed.to);
     if (!handle) {
       return null;
     }
-    const peer: RoutePeer = { kind: "direct", id: handle };
-    const baseSessionKey = buildIMessageBaseSessionKey({
-      cfg: params.cfg,
-      agentId: params.agentId,
-      accountId: params.accountId,
-      peer,
-    });
-    return {
-      sessionKey: baseSessionKey,
-      baseSessionKey,
-      peer,
-      chatType: "direct" as const,
-      from: `imessage:${handle}`,
-      to: `imessage:${handle}`,
-    };
+    const account = resolveIMessageAccount({ cfg: params.cfg, accountId: params.accountId });
+    const service =
+      resolveIMessageDirectChatService(
+        parsed.serviceExplicit ? parsed.service : account.config.service,
+      ) ?? "auto";
+    from = to = `${service}:${handle}`;
+    peer = { kind: "direct", id: handle };
+    recipientSessionExact = isCanonicalIMessageDirectHandle(parsed.to, handle);
+  } else {
+    const peerId =
+      parsed.kind === "chat_id"
+        ? String(parsed.chatId)
+        : parsed.kind === "chat_guid"
+          ? parsed.chatGuid
+          : parsed.chatIdentifier;
+    if (!peerId) {
+      return null;
+    }
+    peer = { kind: "group", id: peerId };
+    from = `imessage:group:${peerId}`;
+    to = `${parsed.kind}:${peerId}`;
   }
-
-  const peerId =
-    parsed.kind === "chat_id"
-      ? String(parsed.chatId)
-      : parsed.kind === "chat_guid"
-        ? parsed.chatGuid
-        : parsed.chatIdentifier;
-  if (!peerId) {
-    return null;
-  }
-  const peer: RoutePeer = { kind: "group", id: peerId };
-  const baseSessionKey = buildIMessageBaseSessionKey({
+  const baseSessionKey = buildOutboundBaseSessionKey({
     cfg: params.cfg,
+    channel: "imessage",
     agentId: params.agentId,
     accountId: params.accountId,
     peer,
   });
-  const toPrefix =
-    parsed.kind === "chat_id"
-      ? "chat_id"
-      : parsed.kind === "chat_guid"
-        ? "chat_guid"
-        : "chat_identifier";
   return {
     sessionKey: baseSessionKey,
     baseSessionKey,
+    recipientSessionExact,
     peer,
-    chatType: "group" as const,
-    from: `imessage:group:${peerId}`,
-    to: `${toPrefix}:${peerId}`,
+    chatType: peer.kind,
+    from,
+    to,
   };
 }
 
-export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount> = {
-  ...createIMessagePluginBase({
-    setupWizard: imessageSetupWizard,
-    setup: imessageSetupAdapter,
-  }),
-  pairing: {
-    idLabel: "imessageSenderId",
-    notifyApproval: async ({ id }) =>
-      await (await loadIMessageChannelRuntime()).notifyIMessageApproval(id),
-  },
-  allowlist: {
-    supportsScope: ({ scope }) => scope === "dm" || scope === "group" || scope === "all",
-    readConfig: ({ cfg, accountId }) => {
-      const account = resolveIMessageAccount({ cfg, accountId });
-      return {
-        dmAllowFrom: (account.config.allowFrom ?? []).map(String),
-        groupAllowFrom: (account.config.groupAllowFrom ?? []).map(String),
-        dmPolicy: account.config.dmPolicy,
-        groupPolicy: account.config.groupPolicy,
-      };
-    },
-    applyConfigEdit: buildAccountScopedAllowlistConfigEditor({
-      channelId: "imessage",
-      normalize: ({ values }) => formatTrimmedAllowFromEntries(values),
-      resolvePaths: (scope) => ({
-        readPaths: [[scope === "dm" ? "allowFrom" : "groupAllowFrom"]],
-        writePath: [scope === "dm" ? "allowFrom" : "groupAllowFrom"],
+export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProbe> =
+  createChatChannelPlugin<ResolvedIMessageAccount, IMessageProbe>({
+    base: {
+      ...createIMessagePluginBase({
+        setupWizard: imessageSetupWizard,
+        setupContract: imessageSetupContract,
       }),
-    }),
-  },
-  security: {
-    resolveDmPolicy: ({ cfg, accountId, account }) => {
-      return buildAccountScopedDmSecurityPolicy({
+      allowlist: buildDmGroupAccountAllowlistAdapter({
+        channelId: "imessage",
+        resolveAccount: resolveIMessageAccount,
+        normalize: ({ values }) => formatTrimmedAllowFromEntries(values),
+        resolveDmAllowFrom: (account) => account.config.allowFrom,
+        resolveGroupAllowFrom: (account) => account.config.groupAllowFrom,
+        resolveDmPolicy: (account) => account.config.dmPolicy,
+        resolveGroupPolicy: (account) => account.config.groupPolicy,
+      }),
+      groups: {
+        resolveRequireMention: resolveIMessageGroupRequireMention,
+        resolveToolPolicy: resolveIMessageGroupToolPolicy,
+      },
+      agentPrompt: {
+        messageToolHints: () => [
+          "- iMessage current conversation: omit target, to, chatId, chatGuid, and chatIdentifier. OpenClaw resolves the trusted current chat server-side; never copy a redacted display value such as `***` into message actions.",
+        ],
+      },
+      doctor: imessageDoctor,
+      conversationBindings: {
+        supportsCurrentConversationBinding: true,
+        bindingStore: "adapter",
+        createManager: ({ cfg, accountId }) =>
+          createIMessageConversationBindingManager({
+            cfg,
+            accountId: accountId ?? undefined,
+          }),
+      },
+      bindings: {
+        compileConfiguredBinding: ({ conversationId }) =>
+          normalizeIMessageAcpConversationId(conversationId),
+        matchInboundConversation: ({ compiledBinding, conversationId }) =>
+          matchIMessageAcpConversation({
+            bindingConversationId: compiledBinding.conversationId,
+            conversationId,
+          }),
+        resolveCommandConversation: ({ originatingTo, commandTo, fallbackTo }) => {
+          const conversationId =
+            resolveIMessageConversationIdFromTarget(originatingTo ?? "") ??
+            resolveIMessageConversationIdFromTarget(commandTo ?? "") ??
+            resolveIMessageConversationIdFromTarget(fallbackTo ?? "");
+          return conversationId ? { conversationId } : null;
+        },
+      },
+      messaging: {
+        normalizeTarget: normalizeIMessageMessagingTarget,
+        inferTargetChatType: ({ to }) => inferIMessageTargetChatType(to),
+        resolveOutboundSessionRoute: (params) => resolveIMessageOutboundSessionRoute(params),
+        targetResolver: {
+          looksLikeId: looksLikeIMessageExplicitTargetId,
+          hint: "<phone|email|chat_id:ID|auto:contact|imessage:contact|sms:contact>",
+          resolveTarget: async ({ input }) => {
+            const to = normalizeIMessageMessagingTarget(input);
+            if (!to) {
+              return null;
+            }
+            const chatType = inferIMessageTargetChatType(to);
+            if (!chatType) {
+              return null;
+            }
+            const parsed = parseIMessageTarget(to);
+            const display =
+              parsed.kind === "handle" &&
+              !isCanonicalIMessageDirectHandle(parsed.to, normalizeIMessageHandle(parsed.to))
+                ? parsed.to.trim()
+                : undefined;
+            return {
+              to,
+              kind: chatType === "direct" ? "user" : "group",
+              ...(display ? { display } : {}),
+              source: "normalized" as const,
+            };
+          },
+        },
+      },
+      status: createComputedAccountStatusAdapter<ResolvedIMessageAccount, IMessageProbe>({
+        defaultRuntime: createDefaultChannelRuntimeState(DEFAULT_ACCOUNT_ID, {
+          cliPath: null,
+          dbPath: null,
+        }),
+        collectStatusIssues: (accounts) => collectStatusIssuesFromLastError("imessage", accounts),
+        buildChannelSummary: ({ snapshot }) =>
+          buildPassiveProbedChannelStatusSummary(snapshot, {
+            cliPath: snapshot.cliPath ?? null,
+            dbPath: snapshot.dbPath ?? null,
+          }),
+        probeAccount: async ({ account, timeoutMs }) =>
+          await (
+            await loadIMessageChannelRuntime()
+          ).probeIMessageAccount({
+            timeoutMs,
+            cliPath: account.config.cliPath,
+            dbPath: account.config.dbPath,
+            ...(account.config.remoteHost ? { remoteHost: account.config.remoteHost } : {}),
+          }),
+        resolveAccountSnapshot: ({ account, runtime }) => ({
+          accountId: account.accountId,
+          name: account.name,
+          enabled: account.enabled,
+          configured: account.configured,
+          extra: {
+            cliPath: runtime?.cliPath ?? account.config.cliPath ?? null,
+            dbPath: runtime?.dbPath ?? account.config.dbPath ?? null,
+          },
+        }),
+        resolveAccountState: ({ enabled }) => (enabled ? "enabled" : "disabled"),
+      }),
+      gateway: {
+        startAccount: async (ctx) => {
+          const conversationBindings = createIMessageConversationBindingManager({
+            cfg: ctx.cfg,
+            accountId: ctx.accountId,
+          });
+          try {
+            return await (await loadIMessageChannelRuntime()).startIMessageGatewayAccount(ctx);
+          } finally {
+            conversationBindings.stop();
+          }
+        },
+      },
+      message: imessageMessageAdapter,
+      actions: imessageMessageActions,
+      approvalCapability: imessageApprovalCapability,
+    },
+    pairing: {
+      text: {
+        idLabel: "imessageSenderId",
+        message: PAIRING_APPROVED_MESSAGE,
+        notify: async (params) => {
+          await (
+            await loadIMessageChannelRuntime()
+          ).sendIMessageOutbound({
+            ...params,
+            to: params.id,
+            text: params.message,
+          });
+        },
+      },
+    },
+    security: imessageSecurityAdapter,
+    threading: {
+      resolveReplyTransport: ({
         cfg,
-        channelKey: "imessage",
         accountId,
-        fallbackAccountId: account.accountId ?? DEFAULT_ACCOUNT_ID,
-        policy: account.config.dmPolicy,
-        allowFrom: account.config.allowFrom ?? [],
-        policyPathSuffix: "dmPolicy",
-      });
+        replyToId,
+        currentMessageId,
+        replyToCurrent,
+        replyToIsExplicit,
+        replyDelivery,
+      }) => {
+        const account = resolveIMessageAccount({ cfg, accountId });
+        if (account.config.actions?.reply === false) {
+          return { replyToId: null };
+        }
+        const existingReplyToId = normalizeOptionalString(replyToId);
+        const explicitCurrentReply = replyToIsExplicit === true && replyToCurrent === true;
+        // Queued replies carry the originating message separately from explicit reply targets.
+        const implicitReplyToId =
+          replyToCurrent === false ||
+          (replyDelivery?.replyToMode === "off" && !explicitCurrentReply)
+            ? undefined
+            : normalizeOptionalString(currentMessageId);
+        return {
+          replyToId: existingReplyToId ?? implicitReplyToId ?? null,
+          ...(!existingReplyToId && !explicitCurrentReply && implicitReplyToId
+            ? { replyToIdSource: "implicit" as const }
+            : {}),
+        };
+      },
     },
-    collectWarnings: ({ account, cfg }) => {
-      return collectAllowlistProviderRestrictSendersWarnings({
-        cfg,
-        providerConfigPresent: cfg.channels?.imessage !== undefined,
-        configuredGroupPolicy: account.config.groupPolicy,
-        surface: "iMessage groups",
-        openScope: "any member",
-        groupPolicyPath: "channels.imessage.groupPolicy",
-        groupAllowFromPath: "channels.imessage.groupAllowFrom",
-        mentionGated: false,
-      });
+    outbound: {
+      base: {
+        deliveryMode: "direct",
+        chunker: chunkMarkdownText,
+        chunkerMode: "markdown",
+        textChunkLimit: 4000,
+        // Native formatting consumes Markdown ranges, so preserve bold and strike semantics.
+        sanitizeText: ({ text }) =>
+          sanitizeForPlainText(sanitizeIMessageFinalOutboundText(sanitizeOutboundText(text)).text, {
+            style: "markdown",
+          }),
+        shouldSuppressLocalPayloadPrompt: ({ cfg, accountId, payload, hint }) =>
+          shouldSuppressLocalIMessageExecApprovalPrompt({ cfg, accountId, payload, hint }),
+        beforeDeliverPayload: async ({ payload, hint }) => {
+          if (hint?.kind !== "approval-pending") {
+            return;
+          }
+          await prepareForwardedIMessageApprovalPayload({
+            payload,
+            approvalKind: hint.approvalKind,
+          });
+        },
+        renderPresentation: ({ payload, presentation }) =>
+          questionGatewayRuntime.prepareReactionPayloadForDelivery({ payload, presentation }),
+        afterDeliverPayload: async (params) =>
+          await registerDeliveredIMessageApprovalPayload(params),
+        deliveryCapabilities: {
+          durableFinal: {
+            text: true,
+            media: true,
+            replyTo: true,
+            messageSendingHooks: true,
+          },
+        },
+      },
+      attachedResults: {
+        channel: "imessage",
+        sendText: (ctx) => sendIMessageOutbound(ctx, "text"),
+        sendMedia: (ctx) =>
+          sendIMessageOutbound(
+            ctx,
+            "media",
+            ctx.onDeliveryResult
+              ? {
+                  onDeliveryResult: async (result) => {
+                    await ctx.onDeliveryResult?.({
+                      channel: "imessage",
+                      ...toIMessageMessageSendResult(
+                        result,
+                        ctx.audioAsVoice ? "voice" : "media",
+                        ctx.replyToId,
+                      ),
+                      messageId: result.messageId,
+                    });
+                  },
+                }
+              : {},
+          ),
+      },
     },
-  },
-  groups: {
-    resolveRequireMention: resolveIMessageGroupRequireMention,
-    resolveToolPolicy: resolveIMessageGroupToolPolicy,
-  },
-  messaging: {
-    normalizeTarget: normalizeIMessageMessagingTarget,
-    resolveOutboundSessionRoute: (params) => resolveIMessageOutboundSessionRoute(params),
-    targetResolver: {
-      looksLikeId: looksLikeIMessageTargetId,
-      hint: "<handle|chat_id:ID>",
-    },
-  },
-  outbound: {
-    deliveryMode: "direct",
-    chunker: (text, limit) => getIMessageRuntime().channel.text.chunkText(text, limit),
-    chunkerMode: "text",
-    textChunkLimit: 4000,
-    sendText: async ({ cfg, to, text, accountId, deps, replyToId }) => {
-      const result = await (
-        await loadIMessageChannelRuntime()
-      ).sendIMessageOutbound({
-        cfg,
-        to,
-        text,
-        accountId: accountId ?? undefined,
-        deps,
-        replyToId: replyToId ?? undefined,
-      });
-      return { channel: "imessage", ...result };
-    },
-    sendMedia: async ({ cfg, to, text, mediaUrl, mediaLocalRoots, accountId, deps, replyToId }) => {
-      const result = await (
-        await loadIMessageChannelRuntime()
-      ).sendIMessageOutbound({
-        cfg,
-        to,
-        text,
-        mediaUrl,
-        mediaLocalRoots,
-        accountId: accountId ?? undefined,
-        deps,
-        replyToId: replyToId ?? undefined,
-      });
-      return { channel: "imessage", ...result };
-    },
-  },
-  status: {
-    defaultRuntime: {
-      accountId: DEFAULT_ACCOUNT_ID,
-      running: false,
-      lastStartAt: null,
-      lastStopAt: null,
-      lastError: null,
-      cliPath: null,
-      dbPath: null,
-    },
-    collectStatusIssues: (accounts) => collectStatusIssuesFromLastError("imessage", accounts),
-    buildChannelSummary: ({ snapshot }) =>
-      buildPassiveProbedChannelStatusSummary(snapshot, {
-        cliPath: snapshot.cliPath ?? null,
-        dbPath: snapshot.dbPath ?? null,
-      }),
-    probeAccount: async ({ timeoutMs }) =>
-      await (await loadIMessageChannelRuntime()).probeIMessageAccount(timeoutMs),
-    buildAccountSnapshot: ({ account, runtime, probe }) => ({
-      accountId: account.accountId,
-      name: account.name,
-      enabled: account.enabled,
-      configured: account.configured,
-      running: runtime?.running ?? false,
-      lastStartAt: runtime?.lastStartAt ?? null,
-      lastStopAt: runtime?.lastStopAt ?? null,
-      lastError: runtime?.lastError ?? null,
-      cliPath: runtime?.cliPath ?? account.config.cliPath ?? null,
-      dbPath: runtime?.dbPath ?? account.config.dbPath ?? null,
-      probe,
-      lastInboundAt: runtime?.lastInboundAt ?? null,
-      lastOutboundAt: runtime?.lastOutboundAt ?? null,
-    }),
-    resolveAccountState: ({ enabled }) => (enabled ? "enabled" : "disabled"),
-  },
-  gateway: {
-    startAccount: async (ctx) =>
-      await (await loadIMessageChannelRuntime()).startIMessageGatewayAccount(ctx),
-  },
-};
+  });
